@@ -66,6 +66,120 @@ func waitGroupExclusiveOK(root ssa.Value, spawner *ssa.Function, g *ssa.Go, goro
 	return true
 }
 
+// waitGroupMutexOK reports fan-out under a WaitGroup where every access that
+// may run concurrent with workers is covered by one free-standing Mutex/RWMutex
+// (package Global or stack Alloc). Post-Wait spawner accesses are exclusive and
+// need not hold the lock. Multiple workers may write the same cell under the lock.
+func waitGroupMutexOK(root ssa.Value, spawner *ssa.Function, g *ssa.Go, goro map[*ssa.Function]bool) bool {
+	if root == nil || spawner == nil || g == nil {
+		return false
+	}
+	wg := waitGroupOfGo(spawner, g)
+	if wg == nil {
+		return false
+	}
+	waitInstr := findWaitAfter(spawner, g, wg)
+	if waitInstr == nil {
+		return false
+	}
+	conc := concurrentFanoutFuncs(spawner, g, goro)
+	if len(conc) == 0 {
+		return false
+	}
+	accesses := fanoutConcurrentAccesses(root, spawner, g, waitInstr, conc)
+	if len(accesses) == 0 {
+		return false
+	}
+	if freeStandingMutexGuards(accesses, conc, false) {
+		return true
+	}
+	return freeStandingMutexGuards(accesses, conc, true)
+}
+
+func fanoutConcurrentAccesses(root ssa.Value, spawner *ssa.Function, g *ssa.Go, wait ssa.Instruction, conc map[*ssa.Function]bool) []dataAccess {
+	var accesses []dataAccess
+	seen := map[ssa.Instruction]bool{}
+	add := func(accs []dataAccess) {
+		for _, acc := range accs {
+			if acc.instr == nil || seen[acc.instr] {
+				continue
+			}
+			seen[acc.instr] = true
+			accesses = append(accesses, acc)
+		}
+	}
+	add(collectDataAccessesDeep(root, conc, map[ssa.Value]bool{}))
+	add(spawnerAccessesBetween(root, spawner, g, wait))
+
+	cells := closureBindingCells(spawner, root)
+	if len(cells) == 0 {
+		if cell := stripToObject(root); cell != nil {
+			cells = []ssa.Value{cell}
+		}
+	}
+	for _, cell := range cells {
+		add(collectDataAccessesDeep(cell, conc, map[ssa.Value]bool{}))
+		add(spawnerAccessesBetween(cell, spawner, g, wait))
+		for fn := range conc {
+			if fn == nil || fn == spawner {
+				continue
+			}
+			for _, fv := range closureFreeVarsBoundTo(spawner, fn, cell) {
+				add(collectDataAccessesDeep(fv, map[*ssa.Function]bool{fn: true}, map[ssa.Value]bool{}))
+			}
+		}
+	}
+	return accesses
+}
+
+func concurrentFanoutFuncs(spawner *ssa.Function, g *ssa.Go, goro map[*ssa.Function]bool) map[*ssa.Function]bool {
+	out := map[*ssa.Function]bool{}
+	for fn := range goro {
+		if fn != nil {
+			out[fn] = true
+		}
+	}
+	for _, b := range spawner.Blocks {
+		for _, instr := range b.Instrs {
+			other, ok := instr.(*ssa.Go)
+			if !ok || other == g {
+				continue
+			}
+			cal := staticCallee(other.Common())
+			if cal == nil {
+				// Unknown sibling body: cannot prove the lock covers it.
+				return nil
+			}
+			for fn := range reachableFuncs(cal, cal.Pkg) {
+				if fn != nil {
+					out[fn] = true
+				}
+			}
+		}
+	}
+	// Include spawner so Alloc mutexes discovered there are candidates; holds
+	// are still checked per access (spawner accesses between go/Wait only).
+	out[spawner] = true
+	return out
+}
+
+func spawnerAccessesBetween(root ssa.Value, fn *ssa.Function, g *ssa.Go, wait ssa.Instruction) []dataAccess {
+	if fn == nil {
+		return nil
+	}
+	all := collectDataAccesses(root, map[*ssa.Function]bool{fn: true})
+	var out []dataAccess
+	for _, acc := range all {
+		if acc.instr == nil || acc.instr.Parent() != fn {
+			continue
+		}
+		if dominatesInstr(g, acc.instr) && dominatesInstr(acc.instr, wait) {
+			out = append(out, acc)
+		}
+	}
+	return out
+}
+
 // siblingTouchesRoot reports a read or write of root inside sibling (including
 // via FreeVars that MakeClosure binds to the same heap/local cell as root).
 func siblingTouchesRoot(root ssa.Value, spawner, sibling *ssa.Function, reach map[*ssa.Function]bool) bool {

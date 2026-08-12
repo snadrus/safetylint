@@ -1,11 +1,12 @@
-package bad_mutex
+package good_local_freemu
 
 import "sync"
 
+// Local free-standing mutex covering all concurrent map accesses.
 func SharedMap() {
 	var mu sync.Mutex
 	m := map[string]int{}
-	go func() { // want `shared memory .* written without channel transfer and no proven lock/atomic/partition guard`
+	go func() {
 		mu.Lock()
 		m["a"] = 1
 		mu.Unlock()

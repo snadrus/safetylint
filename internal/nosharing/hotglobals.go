@@ -40,7 +40,9 @@ func (a *analyzer) computeInitConcurrent() bool {
 		}
 		for _, b := range fn.Blocks {
 			for _, instr := range b.Instrs {
-				if a.isSpawnEvent(instr, spawner) || a.isAsyncRegistration(instr) {
+				// HandleFunc/Handle register callbacks but do not start
+				// goroutines; only true spawn events freeze the package.
+				if a.isSpawnEvent(instr, spawner) {
 					return true
 				}
 			}

@@ -116,6 +116,250 @@ func sharePeers(focus ssa.Value, roots []sharedRoot) []sharedRoot {
 	return out
 }
 
+// sameObjectPeersGo returns roots that alias the same cell as focus (Alloc /
+// Global / FreeVar / Parameter bindings), excluding unrelated same-type locals.
+func sameObjectPeersGo(focus ssa.Value, roots []sharedRoot, spawner *ssa.Function, g *ssa.Go, allFuncs map[*ssa.Function]bool) []sharedRoot {
+	if focus == nil {
+		return nil
+	}
+	funcs := allFuncs
+	if funcs == nil {
+		funcs = map[*ssa.Function]bool{}
+		if spawner != nil {
+			funcs[spawner] = true
+		}
+		for _, r := range roots {
+			if r.val != nil && r.val.Parent() != nil {
+				funcs[r.val.Parent()] = true
+			}
+		}
+	}
+	cells := map[ssa.Value]bool{focus: true}
+	if obj := stripToObject(focus); obj != nil {
+		cells[obj] = true
+	}
+	// Fixpoint: chase Alloc↔Parameter↔FreeVar aliases through call/go sites.
+	for changed := true; changed; {
+		changed = false
+		add := func(v ssa.Value) {
+			if v == nil || cells[v] {
+				return
+			}
+			cells[v] = true
+			changed = true
+		}
+		snapshot := make([]ssa.Value, 0, len(cells))
+		for c := range cells {
+			snapshot = append(snapshot, c)
+		}
+		for _, c := range snapshot {
+			for _, x := range closureBindingCells(spawner, c) {
+				add(x)
+			}
+			for _, x := range goParamBindings(g, c) {
+				add(x)
+			}
+			for _, p := range paramsReceivingCell(c, funcs) {
+				add(p)
+			}
+			for _, x := range argsPassedAs(c, funcs) {
+				add(x)
+				add(stripToObject(x))
+			}
+			if g != nil {
+				for i, arg := range g.Common().Args {
+					if arg == c || stripToObject(arg) == c || stripToObject(arg) == stripToObject(c) {
+						add(arg)
+						add(stripToObject(arg))
+						if cal := staticCallee(g.Common()); cal != nil && i < len(cal.Params) {
+							add(cal.Params[i])
+						}
+					}
+				}
+			}
+		}
+		for _, r := range roots {
+			if r.val == nil {
+				continue
+			}
+			if fv, ok := r.val.(*ssa.FreeVar); ok {
+				for _, b := range closureBindingCells(spawner, fv) {
+					if cells[b] {
+						add(fv)
+					}
+				}
+			}
+			if cells[stripToObject(r.val)] {
+				add(r.val)
+			}
+		}
+	}
+	seen := map[ssa.Value]bool{}
+	var out []sharedRoot
+	addRoot := func(r sharedRoot) {
+		if r.val == nil || seen[r.val] {
+			return
+		}
+		if _, ok := r.val.(*ssa.Global); ok {
+			return
+		}
+		seen[r.val] = true
+		out = append(out, r)
+	}
+	addRoot(sharedRoot{val: focus, reason: "focus"})
+	for _, r := range roots {
+		if r.val == nil {
+			continue
+		}
+		if cells[r.val] || cells[stripToObject(r.val)] {
+			addRoot(r)
+		}
+	}
+	// Also synthesize peers for aliased Parameters/Allocs not already in roots
+	// so their accesses join the mutex proof.
+	for c := range cells {
+		switch c.(type) {
+		case *ssa.Parameter, *ssa.Alloc, *ssa.FreeVar:
+			addRoot(sharedRoot{val: c, reason: "alias"})
+		}
+	}
+	return out
+}
+
+// argsPassedAs returns concrete arguments passed to Parameter cell at call sites.
+func argsPassedAs(cell ssa.Value, funcs map[*ssa.Function]bool) []ssa.Value {
+	p, ok := cell.(*ssa.Parameter)
+	if !ok || p.Parent() == nil {
+		return nil
+	}
+	parent := p.Parent()
+	idx := -1
+	for i, param := range parent.Params {
+		if param == p {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil
+	}
+	var out []ssa.Value
+	for fn := range funcs {
+		if fn == nil {
+			continue
+		}
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				var c *ssa.CallCommon
+				switch in := instr.(type) {
+				case *ssa.Call:
+					c = in.Common()
+				case *ssa.Defer:
+					c = in.Common()
+				case *ssa.Go:
+					c = in.Common()
+				default:
+					continue
+				}
+				cal := c.StaticCallee()
+				if cal != parent && (cal == nil || cal.Origin() != parent) {
+					continue
+				}
+				if idx >= len(c.Args) {
+					continue
+				}
+				out = append(out, c.Args[idx])
+			}
+		}
+	}
+	return out
+}
+
+// paramsReceivingCell finds Parameters of callees in funcs that are passed cell
+// at a static Call/Go/Defer site (same heap identity).
+func paramsReceivingCell(cell ssa.Value, funcs map[*ssa.Function]bool) []*ssa.Parameter {
+	if cell == nil {
+		return nil
+	}
+	seen := map[*ssa.Parameter]bool{}
+	var out []*ssa.Parameter
+	add := func(p *ssa.Parameter) {
+		if p == nil || seen[p] {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	for fn := range funcs {
+		if fn == nil {
+			continue
+		}
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				var c *ssa.CallCommon
+				switch in := instr.(type) {
+				case *ssa.Call:
+					c = in.Common()
+				case *ssa.Defer:
+					c = in.Common()
+				case *ssa.Go:
+					c = in.Common()
+				default:
+					continue
+				}
+				cal := c.StaticCallee()
+				if cal == nil {
+					continue
+				}
+				for i, arg := range c.Args {
+					if stripToObject(arg) != cell || i >= len(cal.Params) {
+						continue
+					}
+					add(cal.Params[i])
+				}
+			}
+		}
+	}
+	return out
+}
+
+// goParamBindings returns Alloc/Global cells passed as the go argument that
+// becomes Parameter focus (or focus itself when not a Parameter).
+func goParamBindings(g *ssa.Go, focus ssa.Value) []ssa.Value {
+	if g == nil || focus == nil {
+		return nil
+	}
+	p, ok := focus.(*ssa.Parameter)
+	if !ok || p.Parent() == nil {
+		return nil
+	}
+	cal := staticCallee(g.Common())
+	if cal == nil {
+		return nil
+	}
+	parent := p.Parent()
+	if cal != parent && (cal.Origin() == nil || cal.Origin() != parent) {
+		if cal.Name() != parent.Name() {
+			return nil
+		}
+	}
+	idx := -1
+	for i, param := range parent.Params {
+		if param == p {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 || idx >= len(g.Common().Args) {
+		return nil
+	}
+	cell := stripToObject(g.Common().Args[idx])
+	if cell == nil {
+		return nil
+	}
+	return []ssa.Value{cell}
+}
+
 // expandRootAliases grows roots to every same-package SSA name for the same
 // shareable objects: allocation sites, parameters that may receive them,
 // free vars and their bindings. Needed so a tied-mutex proof sees every

@@ -809,24 +809,80 @@ func lockUnlockGuard(c *ssa.CallCommon) (guardKey, bool) {
 		}
 		return guardKey{base: stripToObject(fa.X), field: fa.Field}, true
 	}
-	// Free-standing package-level Mutex / *Mutex / RWMutex / *RWMutex.
+	// Free-standing Mutex / *Mutex / RWMutex / *RWMutex: package Global or
+	// stack/heap Alloc (fan-out local locks under WaitGroup). Closure FreeVars
+	// that bind to those cells use the binding as the guard identity.
 	base := recv
 	if u, ok := recv.(*ssa.UnOp); ok && u.Op == token.MUL {
 		base = u.X
 	}
 	base = stripToObject(base)
-	if gl, ok := base.(*ssa.Global); ok {
-		isMu := isNamedSyncType(gl.Type(), "Mutex")
-		isRW := isNamedSyncType(gl.Type(), "RWMutex")
-		if isMu || isRW {
-			if isMu && (name == "RLock" || name == "RUnlock" || name == "TryRLock") {
-				return guardKey{}, false
-			}
-			return guardKey{base: gl, field: -1}, true
+	if cell := freeStandingMutexCell(base); cell != nil {
+		isMu := isNamedSyncType(cell.Type(), "Mutex")
+		if isMu && (name == "RLock" || name == "RUnlock" || name == "TryRLock") {
+			return guardKey{}, false
 		}
+		return guardKey{base: cell, field: -1}, true
 	}
 	// Custom Lock/Unlock/RLock/RUnlock methods that wrap a tied field.
 	return wrapperLockGuard(c, name, base)
+}
+
+// freeStandingMutexCell returns the Global/Alloc identity of a free-standing
+// Mutex/RWMutex value, resolving closure FreeVar bindings when needed.
+func freeStandingMutexCell(v ssa.Value) ssa.Value {
+	if v == nil {
+		return nil
+	}
+	switch cell := v.(type) {
+	case *ssa.Global, *ssa.Alloc:
+		if isNamedSyncType(cell.Type(), "Mutex", "RWMutex") {
+			return cell
+		}
+	case *ssa.FreeVar:
+		if !isNamedSyncType(cell.Type(), "Mutex", "RWMutex") {
+			return nil
+		}
+		parent := cell.Parent()
+		if parent == nil {
+			return nil
+		}
+		// MakeClosure of parent lives in the enclosing function.
+		enc := parent.Parent()
+		if enc == nil {
+			return nil
+		}
+		var found ssa.Value
+		for _, b := range enc.Blocks {
+			for _, instr := range b.Instrs {
+				mc, ok := instr.(*ssa.MakeClosure)
+				if !ok {
+					continue
+				}
+				cf, _ := mc.Fn.(*ssa.Function)
+				if cf != parent {
+					continue
+				}
+				for i, bind := range mc.Bindings {
+					if i >= len(cf.FreeVars) || cf.FreeVars[i] != cell {
+						continue
+					}
+					cellBind := stripToObject(bind)
+					if c := freeStandingMutexCell(cellBind); c != nil {
+						if found != nil && found != c {
+							return nil
+						}
+						found = c
+					}
+				}
+			}
+		}
+		return found
+	case *ssa.Parameter:
+		// Method receivers of Mutex are not free-standing package/local cells.
+		return nil
+	}
+	return nil
 }
 
 // wrapperEntryHold returns the must-held set at entry to an Unlock/RUnlock

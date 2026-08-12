@@ -50,6 +50,16 @@ func accessesGuarded(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Funct
 // values loaded out of atomic cells (separate heap objects) do not poison the
 // parent object's atomics-only proof.
 func objectGuardedRoots(roots []sharedRoot, funcs map[*ssa.Function]bool) bool {
+	return objectGuardedRootsAfter(roots, funcs, nil, nil)
+}
+
+// mutexGuardsGoRootsAfter is mutexGuardsGoRoots ignoring spawner accesses that
+// dominate the go (construction / init before the value is shared).
+func mutexGuardsGoRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, spawner *ssa.Function, g *ssa.Go) bool {
+	return objectGuardedRootsAfter(roots, funcs, spawner, g)
+}
+
+func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, spawner *ssa.Function, g *ssa.Go) bool {
 	if len(roots) >= maxRootAliases {
 		return false
 	}
@@ -73,6 +83,10 @@ func objectGuardedRoots(roots []sharedRoot, funcs map[*ssa.Function]bool) bool {
 		perRoot[root.val] = rAcc
 		for _, acc := range rAcc {
 			if seenAcc[acc.instr] {
+				continue
+			}
+			// Pre-share construction in the spawner is not a concurrent access.
+			if spawner != nil && g != nil && acc.instr.Parent() == spawner && dominatesInstr(acc.instr, g) {
 				continue
 			}
 			seenAcc[acc.instr] = true
@@ -180,18 +194,19 @@ func onlySetupWrites(accesses []dataAccess) bool {
 	return sawWrite
 }
 
-// freeStandingMutexGuards accepts when one package-level Mutex (or RWMutex if
-// rw) Global is held at every access with the right mode.
+// freeStandingMutexGuards accepts when one free-standing Mutex (or RWMutex if
+// rw) — package Global or local Alloc — is held at every access with the right
+// mode. Local Alloc covers WaitGroup fan-out locks (bufLk / errLock / healthyLk).
 func freeStandingMutexGuards(accesses []dataAccess, funcs map[*ssa.Function]bool, rw bool) bool {
-	cands := packageMutexGlobals(funcs, rw)
+	cands := freeStandingMutexCells(funcs, rw)
 	if len(cands) == 0 {
 		return false
 	}
 	heldCache := map[*ssa.Function]map[ssa.Instruction]holdSet{}
 	// Candidates that appear held at least once.
-	var used []*ssa.Global
-	for _, gl := range cands {
-		key := guardKey{base: gl, field: -1}
+	var used []ssa.Value
+	for _, cell := range cands {
+		key := guardKey{base: cell, field: -1}
 		for _, acc := range accesses {
 			fn := acc.instr.Parent()
 			if fn == nil {
@@ -203,13 +218,13 @@ func freeStandingMutexGuards(accesses []dataAccess, funcs map[*ssa.Function]bool
 				heldCache[fn] = held
 			}
 			if mode, ok := held[acc.instr][key]; ok && mode != 0 {
-				used = append(used, gl)
+				used = append(used, cell)
 				break
 			}
 		}
 	}
-	for _, gl := range used {
-		key := guardKey{base: gl, field: -1}
+	for _, cell := range used {
+		key := guardKey{base: cell, field: -1}
 		ok := true
 		for _, acc := range accesses {
 			fn := acc.instr.Parent()
@@ -235,25 +250,39 @@ func freeStandingMutexGuards(accesses []dataAccess, funcs map[*ssa.Function]bool
 	return false
 }
 
-func packageMutexGlobals(funcs map[*ssa.Function]bool, rw bool) []*ssa.Global {
-	seen := map[*ssa.Global]bool{}
-	var out []*ssa.Global
+func freeStandingMutexCells(funcs map[*ssa.Function]bool, rw bool) []ssa.Value {
+	seen := map[ssa.Value]bool{}
+	var out []ssa.Value
 	want := "Mutex"
 	if rw {
 		want = "RWMutex"
 	}
+	add := func(v ssa.Value) {
+		if v == nil || seen[v] {
+			return
+		}
+		if !isNamedSyncType(v.Type(), want) {
+			return
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
 	for fn := range funcs {
-		if fn == nil || fn.Pkg == nil {
+		if fn == nil {
 			continue
 		}
-		for _, mem := range fn.Pkg.Members {
-			gl, ok := mem.(*ssa.Global)
-			if !ok || seen[gl] {
-				continue
+		if fn.Pkg != nil {
+			for _, mem := range fn.Pkg.Members {
+				if gl, ok := mem.(*ssa.Global); ok {
+					add(gl)
+				}
 			}
-			if isNamedSyncType(gl.Type(), want) {
-				seen[gl] = true
-				out = append(out, gl)
+		}
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				if al, ok := instr.(*ssa.Alloc); ok {
+					add(al)
+				}
 			}
 		}
 	}

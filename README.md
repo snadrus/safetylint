@@ -102,10 +102,11 @@ doubt, it **rejects**):
      (unexported or in `package main`, address never taken, never a
      goroutine body).
 
-   A *spawn point* is any `go` statement, any dynamic/interface call, any
+   A *spawn point* is any `go` statement, any dynamic func-value call, any
    Fact-bearing spawner (`MaySpawn` / `MayShareParams`), or a curated stdlib
-   server API (`http.ListenAndServe`, `Serve`, …) — not every Fact-less
-   cross-package call. After the first spawn point, globals are frozen:
+   server API (`http.ListenAndServe`, `Serve`, …) — not `http.HandleFunc` /
+   `Handle` registration, and not every Fact-less or interface method call.
+   After the first spawn point, globals are frozen:
    **reads stay legal**, and writes are refused unless the guard cascade
    proves a lock/atomic/partition (including a free-standing package mutex
    held at every touch), a fully Once-synchronized global, or an **InitOnly**
@@ -117,7 +118,9 @@ doubt, it **rejects**):
    mutations. Deferred non-mutex calls do not drop held locks. Same-package
    generic helpers are followed like ordinary callees. After `WaitGroup.Wait`,
    locals that were only shared into completed waiters (and not touched by
-   sibling goroutines unsoundly) are exclusive again.
+   sibling goroutines unsoundly) are exclusive again. Fan-out under a
+   WaitGroup may also share cells guarded by a **stack-local** free-standing
+   mutex for the concurrent window; post-Wait parent access is exclusive.
 
 4. **Cross-package share Facts** (`nosharing`)
 

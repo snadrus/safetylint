@@ -287,12 +287,25 @@ func (a *analyzer) checkGoCallee(g *ssa.Go, spawner, callee *ssa.Function, globa
 		if (writtenInGoro || writtenAfter) && waitGroupExclusiveOK(root.val, spawner, g, reachable) {
 			continue
 		}
+		// WaitGroup + free-standing/local mutex during the fan-out; post-Wait
+		// parent access is exclusive (treed_build / apiinfo healthyLk).
+		if (writtenInGoro || writtenAfter) && waitGroupMutexOK(root.val, spawner, g, reachable) {
+			continue
+		}
 
 		if writtenInGoro || writtenAfter {
-			// Prove over same-object peers only (same strip/type). Package
-			// globals and unrelated alias expansions (loggers, other allocs)
-			// must not poison this root's lock/atomic/partition proof.
-			if mutexGuardsGoRoots(sharePeers(root.val, roots), allFuncs) {
+			// Atomics-only first on this root alone (denylist Filter): peer
+			// unions must not demand a mutex for pure atomic.Pointer cells.
+			if atomicsOnlyAccesses(collectDataAccessesDeep(root.val, allFuncs, map[ssa.Value]bool{})) {
+				for _, r := range roots {
+					seen["write:"+typeKey(r.val)] = true
+				}
+				continue
+			}
+			// Same-object peers only (not same-type): unrelated *T locals must
+			// not poison the lock proof. Pre-go construction stores in the
+			// spawner are before the share and are ignored.
+			if mutexGuardsGoRootsAfter(sameObjectPeersGo(root.val, roots, spawner, g, allFuncs), allFuncs, spawner, g) {
 				for _, r := range roots {
 					seen["write:"+typeKey(r.val)] = true
 				}

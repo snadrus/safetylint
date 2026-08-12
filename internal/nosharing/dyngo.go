@@ -191,10 +191,15 @@ func (a *analyzer) resolveFuncParam(p *ssa.Parameter, visiting map[ssa.Value]boo
 }
 
 // resolveFuncAddr chases stores into a func-typed address (FieldAddr / Alloc).
+// FreeVars of *func (nested closures capturing a func local) resolve via
+// MakeClosure bindings first.
 func (a *analyzer) resolveFuncAddr(addr ssa.Value, visiting map[ssa.Value]bool) []*ssa.Function {
 	addr = stripFuncAddr(addr)
 	if addr == nil {
 		return nil
+	}
+	if fv, ok := addr.(*ssa.FreeVar); ok {
+		return a.resolveFuncFreeVarAddr(fv, visiting)
 	}
 	if funcFieldExported(addr) {
 		return nil
@@ -234,6 +239,55 @@ func (a *analyzer) resolveFuncAddr(addr ssa.Value, visiting map[ssa.Value]bool) 
 		}
 	}
 	if !foundStore || len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (a *analyzer) resolveFuncFreeVarAddr(fv *ssa.FreeVar, visiting map[ssa.Value]bool) []*ssa.Function {
+	if fv == nil || fv.Parent() == nil {
+		return nil
+	}
+	var out []*ssa.Function
+	seen := map[*ssa.Function]bool{}
+	complete := false
+	for _, fn := range a.funcs {
+		if fn == nil {
+			continue
+		}
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				mc, ok := instr.(*ssa.MakeClosure)
+				if !ok {
+					continue
+				}
+				cf, _ := mc.Fn.(*ssa.Function)
+				if cf != fv.Parent() {
+					continue
+				}
+				for i, bind := range mc.Bindings {
+					if i >= len(cf.FreeVars) || cf.FreeVars[i] != fv {
+						continue
+					}
+					complete = true
+					part := a.resolveFuncValue(bind, visiting)
+					if part == nil {
+						part = a.resolveFuncAddr(bind, visiting)
+					}
+					if part == nil {
+						return nil
+					}
+					for _, f := range part {
+						if !seen[f] {
+							seen[f] = true
+							out = append(out, f)
+						}
+					}
+				}
+			}
+		}
+	}
+	if !complete || len(out) == 0 {
 		return nil
 	}
 	return out

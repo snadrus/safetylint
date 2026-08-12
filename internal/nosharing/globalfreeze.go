@@ -330,9 +330,9 @@ func (a *analyzer) computeSpawners() map[*ssa.Function]bool {
 }
 
 func (a *analyzer) isSpawnEvent(instr ssa.Instruction, spawner map[*ssa.Function]bool) bool {
-	if a.isAsyncRegistration(instr) {
-		return true
-	}
+	// http.HandleFunc/Handle and similar only register callbacks; they do not
+	// start serving goroutines. Callback captures are still share events via
+	// checkAsyncCallbackShares. Freeze spawn is Serve/ListenAndServe/go/Facts.
 	var c *ssa.CallCommon
 	switch in := instr.(type) {
 	case *ssa.Go:
@@ -350,11 +350,14 @@ func (a *analyzer) isSpawnEvent(instr ssa.Instruction, spawner map[*ssa.Function
 		}
 	}
 	if c.IsInvoke() {
-		// Interface method: callee unknown; may start concurrency.
-		return true
+		// Interface method: unknown callee. Treat like Fact-less cross-package
+		// calls — do not freeze the package (absence of a Fact is not proof a
+		// goroutine started). Sharing of interface values is handled elsewhere.
+		return false
 	}
 	callee := c.StaticCallee()
 	if callee == nil {
+		// Dynamic func value: may start concurrency when invoked.
 		return true
 	}
 	if callee.Pkg == a.pkg {
