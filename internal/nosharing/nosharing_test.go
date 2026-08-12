@@ -46,6 +46,7 @@ func TestNosharing(t *testing.T) {
 		"good_global_read",
 		"good_global_atomic",
 		"good_atomic_share",
+		"good_atomic_filter",
 		"good_partition_buf",
 		"good_global_errmethod",
 		"good_global_mapsvalues",

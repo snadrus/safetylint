@@ -44,8 +44,11 @@ func accessesGuarded(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Funct
 	return false
 }
 
-// objectGuardedRoots is the multi-root variant used at go sites: one consistent
-// tied/free/RW guard across all sibling aliases, else atomics/partition.
+// objectGuardedRoots is the multi-root variant used at go sites.
+// Tied/free-standing mutex proofs may use the union of sibling-alias accesses
+// (one consistent guard). Atomics and partition proofs are per written root so
+// values loaded out of atomic cells (separate heap objects) do not poison the
+// parent object's atomics-only proof.
 func objectGuardedRoots(roots []sharedRoot, funcs map[*ssa.Function]bool) bool {
 	if len(roots) >= maxRootAliases {
 		return false
@@ -54,18 +57,28 @@ func objectGuardedRoots(roots []sharedRoot, funcs map[*ssa.Function]bool) bool {
 	seenAcc := map[ssa.Instruction]bool{}
 	visiting := map[ssa.Value]bool{}
 	var dataRoots []ssa.Value
+	perRoot := map[ssa.Value][]dataAccess{}
 	for _, root := range roots {
 		if isChanType(root.val.Type()) || isWhitelistedSync(root.val) || isSyncMutex(root.val) || isSyncRWMutex(root.val) || isShareSafeStdlib(root.val) {
 			continue
 		}
+		// Package globals are covered by freeze analysis; including them here
+		// (e.g. a logger touched inside the goro) poisons per-root proofs.
+		if _, ok := root.val.(*ssa.Global); ok {
+			continue
+		}
 		dataRoots = append(dataRoots, root.val)
-		for _, acc := range collectDataAccessesDeep(root.val, funcs, visiting) {
+		rootVisiting := map[ssa.Value]bool{}
+		rAcc := collectDataAccessesDeep(root.val, funcs, rootVisiting)
+		perRoot[root.val] = rAcc
+		for _, acc := range rAcc {
 			if seenAcc[acc.instr] {
 				continue
 			}
 			seenAcc[acc.instr] = true
 			accesses = append(accesses, acc)
 		}
+		_ = visiting
 	}
 	if len(accesses) == 0 {
 		return true
@@ -108,15 +121,63 @@ func objectGuardedRoots(roots []sharedRoot, funcs map[*ssa.Function]bool) bool {
 	if freeStandingMutexGuards(accesses, funcs, true) {
 		return true
 	}
-	if atomicsOnlyAccesses(accesses) {
-		return true
-	}
-	// Partition over the union of sibling-alias accesses so all writer
-	// goroutines are considered together.
+	// Partition must stay collective so sibling closure FreeVars of one buffer
+	// are checked for disjoint indexes together.
 	if len(dataRoots) > 0 && constIndexPartitionOK(dataRoots[0], accesses) {
 		return true
 	}
+
+	// Atomics (and other per-object proofs) run per written root so values
+	// loaded from atomic cells do not poison the parent object.
+	for _, r := range dataRoots {
+		rAcc := perRoot[r]
+		if !accessesHaveWrite(rAcc) || onlySetupWrites(rAcc) {
+			continue
+		}
+		if hasTiedMutex(findStructuralGuards(r), rAcc) {
+			continue
+		}
+		if freeStandingMutexGuards(rAcc, funcs, false) {
+			continue
+		}
+		if hasTiedMutex(findStructuralRWGuards(r), rAcc) {
+			continue
+		}
+		if freeStandingMutexGuards(rAcc, funcs, true) {
+			continue
+		}
+		if atomicsOnlyAccesses(rAcc) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func accessesHaveWrite(accesses []dataAccess) bool {
+	for _, acc := range accesses {
+		if acc.write {
+			return true
+		}
+	}
 	return false
+}
+
+// onlySetupWrites reports accesses whose writes are solely object/header
+// initialization (not element or field mutation of interest).
+func onlySetupWrites(accesses []dataAccess) bool {
+	sawWrite := false
+	for _, acc := range accesses {
+		if !acc.write {
+			continue
+		}
+		sawWrite = true
+		if isObjectInitStore(acc) || isSliceHeaderStore(acc) || isShareSafeFieldStore(acc) {
+			continue
+		}
+		return false
+	}
+	return sawWrite
 }
 
 // freeStandingMutexGuards accepts when one package-level Mutex (or RWMutex if
@@ -207,17 +268,53 @@ func rwMutexGuards(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Functio
 	return freeStandingMutexGuards(accesses, funcs, true)
 }
 
-// atomicsOnlyAccesses reports whether every access is via sync/atomic.
+// atomicsOnlyAccesses reports whether concurrent mutation of the object is
+// only via sync/atomic. Plain reads are allowed (e.g. an immutable context
+// field). Construction stores of share-safe values (context.Context) are
+// allowed; any other plain write fails the proof.
 func atomicsOnlyAccesses(accesses []dataAccess) bool {
 	if len(accesses) == 0 {
 		return false
 	}
+	sawAtomic := false
 	for _, acc := range accesses {
-		if !isAtomicAccess(acc) {
-			return false
+		if isAtomicAccess(acc) {
+			sawAtomic = true
+			continue
 		}
+		if !acc.write {
+			continue // plain read of a non-atomic field
+		}
+		if isShareSafeFieldStore(acc) || isObjectInitStore(acc) {
+			continue
+		}
+		return false
 	}
-	return true
+	return sawAtomic
+}
+
+func isShareSafeFieldStore(acc dataAccess) bool {
+	st, ok := acc.instr.(*ssa.Store)
+	if !ok {
+		return false
+	}
+	if isContextType(st.Val.Type()) {
+		return true
+	}
+	return isContextType(pointeeType(st.Addr.Type()))
+}
+
+// isObjectInitStore reports a whole-struct store through the object pointer
+// (composite literal initialization), not a field store.
+func isObjectInitStore(acc dataAccess) bool {
+	st, ok := acc.instr.(*ssa.Store)
+	if !ok {
+		return false
+	}
+	if _, isFA := st.Addr.(*ssa.FieldAddr); isFA {
+		return false
+	}
+	return structOf(st.Val.Type()) != nil && structOf(pointeeType(st.Addr.Type())) != nil
 }
 
 func isAtomicAccess(acc dataAccess) bool {

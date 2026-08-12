@@ -76,6 +76,56 @@ func collectRoots(g *ssa.Go, callee *ssa.Function, globals map[*ssa.Global]bool)
 	return roots
 }
 
+// nonGlobalRoots filters out package globals (handled by freeze analysis).
+func nonGlobalRoots(roots []sharedRoot) []sharedRoot {
+	var out []sharedRoot
+	for _, r := range roots {
+		if _, ok := r.val.(*ssa.Global); ok {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// sharePeers returns focus plus non-global roots that refer to the same
+// shared object identity: same stripToObject, or the same pointer/element
+// type (so Alloc/Param/FreeVar views of one value stay together for tied
+// mutex and partition proofs without pulling in unrelated aliases).
+func sharePeers(focus ssa.Value, roots []sharedRoot) []sharedRoot {
+	if focus == nil {
+		return nil
+	}
+	focusObj := stripToObject(focus)
+	focusTy := focus.Type().String()
+	seen := map[ssa.Value]bool{}
+	var out []sharedRoot
+	add := func(r sharedRoot) {
+		if r.val == nil || seen[r.val] {
+			return
+		}
+		if _, ok := r.val.(*ssa.Global); ok {
+			return
+		}
+		seen[r.val] = true
+		out = append(out, r)
+	}
+	add(sharedRoot{val: focus, reason: "focus"})
+	for _, r := range roots {
+		if r.val == nil {
+			continue
+		}
+		if r.val == focus || stripToObject(r.val) == focusObj {
+			add(r)
+			continue
+		}
+		if r.val.Type().String() == focusTy {
+			add(r)
+		}
+	}
+	return out
+}
+
 // expandRootAliases grows roots to every same-package SSA name for the same
 // shareable objects: allocation sites, parameters that may receive them,
 // free vars and their bindings. Needed so a tied-mutex proof sees every

@@ -264,8 +264,10 @@ func (a *analyzer) checkGo(g *ssa.Go, spawner *ssa.Function, globals map[*ssa.Gl
 		writtenAfter := isWrittenAfterGo(root.val, spawner, g, a.funcs, reachable)
 
 		if writtenInGoro || writtenAfter {
-			// Prove over all sibling aliases for this go via the guard cascade.
-			if mutexGuardsGoRoots(roots, allFuncs) {
+			// Prove over same-object peers only (same strip/type). Package
+			// globals and unrelated alias expansions (loggers, other allocs)
+			// must not poison this root's lock/atomic/partition proof.
+			if mutexGuardsGoRoots(sharePeers(root.val, roots), allFuncs) {
 				for _, r := range roots {
 					seen["write:"+typeKey(r.val)] = true
 				}

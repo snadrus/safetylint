@@ -242,8 +242,39 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 		if isMutexGuardCall(c) {
 			return
 		}
+		if !c.IsInvoke() {
+			if b, ok := c.Value.(*ssa.Builtin); ok {
+				switch b.Name() {
+				case "len", "cap":
+					for _, arg := range c.Args {
+						if derived[arg] {
+							add(instr, arg, false)
+							return
+						}
+					}
+					return
+				case "append", "copy", "clear", "delete":
+					for _, arg := range c.Args {
+						if derived[arg] {
+							add(instr, arg, true)
+							return
+						}
+					}
+					return
+				}
+			}
+		}
 		if cal := c.StaticCallee(); cal != nil {
 			if isWhitelistedSyncMethod(cal, recvOfCall(c)) || isRWMutexMethod(cal) || isSyncMutexMethod(cal) {
+				return
+			}
+			if isAtomicCallee(cal) || (cal.Signature.Recv() != nil && isAtomicValueType(cal.Signature.Recv().Type())) {
+				for _, arg := range c.Args {
+					if derived[arg] && !isMutexFieldAddr(arg) {
+						add(instr, arg, true)
+						return
+					}
+				}
 				return
 			}
 			if len(cal.Blocks) > 0 && instr.Parent() != nil && cal.Pkg == instr.Parent().Pkg {
