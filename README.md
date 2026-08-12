@@ -25,6 +25,14 @@ go build -o safetylint ./cmd/safetylint
 ./safetylint ./...
 ```
 
+Pass the same `-tags` you use for `go build` so constrained files match the
+binary (comma- or space-separated). Example matching Curio’s `make curio-pdp`
+/ `make skiff`:
+
+```bash
+./safetylint -tags "cunative nosupraseal skiff" -test=false ./cmd/skiff
+```
+
 Exit status is non-zero if any diagnostic is reported (via `multichecker`).
 
 ## What it proves
