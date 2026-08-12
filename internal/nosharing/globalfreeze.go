@@ -111,7 +111,7 @@ func (a *analyzer) checkGlobalFreeze(reported map[string]bool) {
 					if a.isInitOnlyFunc(fn) {
 						continue
 					}
-					if a.onceGuardsGlobalWrite(gl, instr) {
+					if a.onceProtectsGlobal(gl) {
 						continue
 					}
 					if isSingleflightGroup(gl.Type()) {

@@ -511,11 +511,8 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 		if known, writes := writesParamsFact(pass, c, v); known {
 			return writes
 		}
-		// Bodyless with []byte/string arg: default read-only payload.
-		if argOrRecvIs(c, v) && isReadOnlyPayloadType(v.Type()) {
-			return false
-		}
-		// Still unknown: pessimistic.
+		// Still unknown: pessimistic. ([]byte/string read-only defaults apply
+		// only to interface invokes above — not arbitrary bodyless APIs.)
 		if pessimistic && argOrRecvIs(c, v) {
 			return true
 		}
@@ -525,6 +522,9 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 	if isShareSafeStdlib(v) {
 		return false
 	}
+	// Func values / unknown callees: keep []byte/string as read-only payloads
+	// (Broadcast ErrorHook-style callbacks). Bodyless static APIs above stay
+	// pessimistic so mutate([]byte) is still a write.
 	if argOrRecvIs(c, v) && isReadOnlyPayloadType(v.Type()) {
 		return false
 	}

@@ -6,9 +6,66 @@ import (
 	"golang.org/x/tools/go/ssa"
 )
 
-// onceGuardsGlobalWrite reports that instr writes gl only inside a sync.Once.Do
-// callback whose Once receiver belongs to gl — the lazyValue pattern.
-func (a *analyzer) onceGuardsGlobalWrite(gl *ssa.Global, instr ssa.Instruction) bool {
+// onceProtectsGlobal reports that every non-Once data access to gl is
+// synchronized by sync.Once.Do on an Once that belongs to gl: either the
+// access is inside such a Do callback, or it is dominated by a Do call on
+// that Once in the same function (lazyValue get() pattern).
+//
+// A bare concurrent load of gl outside Do is enough to reject the proof —
+// freeze only checks writers, so Once must not exempt writes unless readers
+// are covered too.
+func (a *analyzer) onceProtectsGlobal(gl *ssa.Global) bool {
+	if gl == nil || a.pkg == nil {
+		return false
+	}
+	if cached, ok := a.onceOK[gl]; ok {
+		return cached
+	}
+	ok := a.computeOnceProtects(gl)
+	if a.onceOK == nil {
+		a.onceOK = map[*ssa.Global]bool{}
+	}
+	a.onceOK[gl] = ok
+	return ok
+}
+
+func (a *analyzer) computeOnceProtects(gl *ssa.Global) bool {
+	all := map[*ssa.Function]bool{}
+	for _, fn := range a.funcs {
+		if fn != nil {
+			all[fn] = true
+		}
+	}
+	accs := collectDataAccesses(gl, all)
+	if len(accs) == 0 {
+		return false
+	}
+	sawData := false
+	for _, acc := range accs {
+		if isOnceFieldAddrOf(acc.addr, gl) {
+			continue
+		}
+		sawData = true
+		if a.accessOnceSynced(gl, acc.instr) {
+			continue
+		}
+		return false
+	}
+	return sawData
+}
+
+func isOnceFieldAddrOf(addr ssa.Value, gl *ssa.Global) bool {
+	if addr == nil || gl == nil {
+		return false
+	}
+	fa, ok := addr.(*ssa.FieldAddr)
+	if !ok || stripToObject(fa.X) != gl {
+		return false
+	}
+	return isNamedSyncType(fa.Type(), "Once")
+}
+
+func (a *analyzer) accessOnceSynced(gl *ssa.Global, instr ssa.Instruction) bool {
 	if gl == nil || instr == nil {
 		return false
 	}
@@ -19,6 +76,29 @@ func (a *analyzer) onceGuardsGlobalWrite(gl *ssa.Global, instr ssa.Instruction) 
 	for cur := fn; cur != nil; cur = cur.Parent() {
 		if a.closurePassedToOnceOn(gl, cur) {
 			return true
+		}
+	}
+	return a.dominatedByOnceDo(gl, instr)
+}
+
+// dominatedByOnceDo reports a same-function Once.Do on gl that dominates instr.
+func (a *analyzer) dominatedByOnceDo(gl *ssa.Global, instr ssa.Instruction) bool {
+	fn := instr.Parent()
+	if fn == nil {
+		return false
+	}
+	for _, b := range fn.Blocks {
+		for _, in := range b.Instrs {
+			call, ok := in.(*ssa.Call)
+			if !ok || !isOnceDoCall(call.Common()) {
+				continue
+			}
+			if !a.onceRecvIsGlobal(recvOfCall(call.Common()), gl, nil) {
+				continue
+			}
+			if dominatesInstr(call, instr) {
+				return true
+			}
 		}
 	}
 	return false
@@ -95,7 +175,6 @@ func (a *analyzer) onceRecvIsGlobal(recv ssa.Value, gl *ssa.Global, mc *ssa.Make
 	if fa, ok := recv.(*ssa.FieldAddr); ok && stripToObject(fa.X) == gl {
 		return true
 	}
-	// Method receiver Param / FreeVar that aliases the global at call sites.
 	switch b := base.(type) {
 	case *ssa.Parameter:
 		return a.paramReceivesGlobal(b, gl)
@@ -116,7 +195,6 @@ func (a *analyzer) onceRecvIsGlobal(recv ssa.Value, gl *ssa.Global, mc *ssa.Make
 			}
 		}
 	}
-	// Load of *Global.
 	if u, ok := recv.(*ssa.UnOp); ok && u.Op == token.MUL {
 		return stripToObject(u.X) == gl
 	}
@@ -131,6 +209,10 @@ func (a *analyzer) paramReceivesGlobal(p *ssa.Parameter, gl *ssa.Global) bool {
 		return false
 	}
 	parent := p.Parent()
+	// Exported methods may be called from other packages with other receivers.
+	if obj := parent.Object(); obj != nil && obj.Exported() {
+		return false
+	}
 	idx := -1
 	for i, param := range parent.Params {
 		if param == p {
@@ -141,6 +223,7 @@ func (a *analyzer) paramReceivesGlobal(p *ssa.Parameter, gl *ssa.Global) bool {
 	if idx < 0 {
 		return false
 	}
+	saw := false
 	for _, fn := range a.funcs {
 		if fn == nil {
 			continue
@@ -158,22 +241,19 @@ func (a *analyzer) paramReceivesGlobal(p *ssa.Parameter, gl *ssa.Global) bool {
 				}
 				cal := c.StaticCallee()
 				if cal != parent && (cal == nil || cal.Origin() != parent) {
-					// Also match generic instances of parent.
-					if cal == nil || cal.Name() != parent.Name() {
-						continue
-					}
-					if !calleeInPkg(cal, a.pkg) {
+					if cal == nil || cal.Name() != parent.Name() || !calleeInPkg(cal, a.pkg) {
 						continue
 					}
 				}
 				if idx >= len(c.Args) {
 					continue
 				}
-				if stripToObject(c.Args[idx]) == gl {
-					return true
+				saw = true
+				if stripToObject(c.Args[idx]) != gl {
+					return false
 				}
 			}
 		}
 	}
-	return false
+	return saw
 }

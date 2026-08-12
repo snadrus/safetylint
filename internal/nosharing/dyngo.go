@@ -125,6 +125,15 @@ func (a *analyzer) resolveFuncParam(p *ssa.Parameter, visiting map[ssa.Value]boo
 		return nil
 	}
 	parent := p.Parent()
+	// Exported functions may receive arbitrary funcs from other packages —
+	// same-package call sites cannot complete the set.
+	if obj := parent.Object(); obj != nil && obj.Exported() {
+		return nil
+	}
+	_, _, addrTaken := a.callSiteIndex()
+	if addrTaken[parent] {
+		return nil
+	}
 	idx := -1
 	for i, param := range parent.Params {
 		if param == p {
@@ -187,6 +196,9 @@ func (a *analyzer) resolveFuncAddr(addr ssa.Value, visiting map[ssa.Value]bool) 
 	if addr == nil {
 		return nil
 	}
+	if funcFieldExported(addr) {
+		return nil
+	}
 	var out []*ssa.Function
 	seen := map[*ssa.Function]bool{}
 	foundStore := false
@@ -203,6 +215,9 @@ func (a *analyzer) resolveFuncAddr(addr ssa.Value, visiting map[ssa.Value]bool) 
 				}
 				if !funcStoreMatches(st.Addr, addr) {
 					continue
+				}
+				if funcFieldExported(st.Addr) {
+					return nil
 				}
 				foundStore = true
 				part := a.resolveFuncValue(st.Val, visiting)
@@ -222,6 +237,21 @@ func (a *analyzer) resolveFuncAddr(addr ssa.Value, visiting map[ssa.Value]bool) 
 		return nil
 	}
 	return out
+}
+
+
+// funcFieldExported reports an address of an exported struct field.
+func funcFieldExported(addr ssa.Value) bool {
+	addr = stripFuncAddr(addr)
+	fa, ok := addr.(*ssa.FieldAddr)
+	if !ok {
+		return false
+	}
+	st := structOf(fa.X.Type())
+	if st == nil || fa.Field < 0 || fa.Field >= st.NumFields() {
+		return false
+	}
+	return token.IsExported(st.Field(fa.Field).Name())
 }
 
 func funcStoreMatches(storeAddr, loadAddr ssa.Value) bool {

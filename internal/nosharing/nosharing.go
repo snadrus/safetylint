@@ -165,6 +165,7 @@ type analyzer struct {
 	localInitOnly  map[*types.Func]bool
 	localHot       *HotGlobals
 	initConcurrent bool
+	onceOK         map[*ssa.Global]bool
 }
 
 func (a *analyzer) run() {
@@ -280,20 +281,11 @@ func (a *analyzer) checkGoCallee(g *ssa.Go, spawner, callee *ssa.Function, globa
 			writtenAfter = false
 		}
 		// WaitGroup fan-out/join: exclusive ownership of result locals after Wait
-		// (also read-only captures while workers run).
-		if writtenInGoro || writtenAfter {
-			wgOK := waitGroupExclusiveOK(root.val, spawner, g, reachable)
-			if !wgOK {
-				for _, peer := range sharePeers(root.val, roots) {
-					if waitGroupExclusiveOK(peer.val, spawner, g, reachable) {
-						wgOK = true
-						break
-					}
-				}
-			}
-			if wgOK {
-				continue
-			}
+		// (also read-only captures while workers run). Only this root's cell —
+		// not same-type sharePeers — may prove the join (same-type peers are
+		// unrelated locals and would unsoundly silence races).
+		if (writtenInGoro || writtenAfter) && waitGroupExclusiveOK(root.val, spawner, g, reachable) {
+			continue
 		}
 
 		if writtenInGoro || writtenAfter {

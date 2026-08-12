@@ -71,14 +71,18 @@ doubt, it **rejects**):
    - **InitOnly** registration helpers (package-level **map/slice** globals only,
      no spawn, init-only callers) may write those tables; importers must call
      them only from `init` / var initializers (`var _ = Reg(…)`).
-   - `[]byte`/`string` payloads and interface method receivers are not assumed
-     written by bodyless/interface calls (Broadcast-style fan-out).
+   - `[]byte`/`string` payloads on **interface invokes** and unknown func
+     values are treated as read-only (Broadcast-style fan-out). Ordinary
+     bodyless static APIs stay pessimistic (a `mutate([]byte)` helper is a write).
    - Dynamic `go fn(…)` is allowed when every same-package assignment to `fn`
-     is a known local function/closure; otherwise it is refused.
+     is a known local function/closure through **unexported** paths; exported
+     setters/params cannot complete the set. Otherwise it is refused.
    - **WaitGroup fan-out/join**: result locals written by one worker (or
-     read-only during the fan-out) with `Wait` before the parent uses them.
-   - **`sync.Once.Do`** callbacks may write sibling fields of the same object
-     (lazy init). `singleflight.Group` is treated as a sync object.
+     read-only during the fan-out) with `Wait` before the parent uses them;
+     a writing worker may not share the cell with a sibling reader/writer.
+   - **`sync.Once`**: a global is exempt from freeze only when **every**
+     non-Once access is Once-synchronized (inside `Do` or dominated by `Do`
+     on that object). `singleflight.Group` is treated as a sync object.
    - Deferred non-mutex calls do not drop freemu holds (e.g. `defer` close
      while a package mutex is held).
    - `mu.TryLock()` / `TryRLock()` only count as an acquire on CFG paths where
