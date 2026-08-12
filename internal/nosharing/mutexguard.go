@@ -86,8 +86,13 @@ func mutexGuardsGoRoots(roots []sharedRoot, funcs map[*ssa.Function]bool) bool {
 	seenAcc := map[ssa.Instruction]bool{}
 	visiting := map[ssa.Value]bool{}
 
+	// Too many aliases ⇒ incomplete/pathological set; fail closed without
+	// quadratic deep access collection that can hang on large packages.
+	if len(roots) >= maxRootAliases {
+		return false
+	}
 	for _, root := range roots {
-		if isChanType(root.val.Type()) || isWhitelistedSync(root.val) || isSyncMutex(root.val) || isSyncRWMutex(root.val) {
+		if isChanType(root.val.Type()) || isWhitelistedSync(root.val) || isSyncMutex(root.val) || isSyncRWMutex(root.val) || isShareSafeStdlib(root.val) {
 			continue
 		}
 		for _, c := range findStructuralGuards(root.val) {
@@ -797,7 +802,7 @@ func stripToObject(v ssa.Value) ssa.Value {
 		case *ssa.Slice:
 			v = x.X
 		case *ssa.Extract:
-			v = x.Tuple
+			return v
 		case *ssa.Alloc, *ssa.Parameter, *ssa.FreeVar, *ssa.Global:
 			return v
 		default:
@@ -831,6 +836,52 @@ func mutexFields(st *types.Struct) []int {
 		}
 	}
 	return out
+}
+
+func rwMutexFields(st *types.Struct) []int {
+	var out []int
+	for i := 0; i < st.NumFields(); i++ {
+		if isNamedSyncType(st.Field(i).Type(), "RWMutex") {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// hasStructuralRWMutex reports whether root's pointed-to struct (or a FieldAddr
+// parent) embeds a sync.RWMutex. Used to give RWMutex-specific refusal messaging
+// when a tied sync.Mutex proof fails.
+func hasStructuralRWMutex(root ssa.Value) bool {
+	if root == nil {
+		return false
+	}
+	if st := structOf(root.Type()); st != nil && len(rwMutexFields(st)) > 0 {
+		return true
+	}
+	for cur := root; cur != nil; {
+		switch v := cur.(type) {
+		case *ssa.UnOp:
+			if v.Op == token.MUL {
+				cur = v.X
+				continue
+			}
+			return false
+		case *ssa.ChangeType:
+			cur = v.X
+			continue
+		case *ssa.Convert:
+			cur = v.X
+			continue
+		case *ssa.FieldAddr:
+			if st := structOf(v.X.Type()); st != nil && len(rwMutexFields(st)) > 0 {
+				return true
+			}
+			cur = v.X
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 func cloneGuardSet(s map[guardKey]bool) map[guardKey]bool {

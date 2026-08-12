@@ -496,13 +496,18 @@ func (a *analyzer) globalWritesCall(c *ssa.CallCommon) []*ssa.Global {
 
 	callee := c.StaticCallee()
 	if callee == nil {
-		// Dynamic call: address-of-global or mutable map/slice load only.
-		return a.globalWritesCallArgs(c, true)
+		// Interface/dynamic call: do not treat an invoke on a loaded interface
+		// global (e.g. err.Error()) as writing the global binding. Map/slice
+		// headers still count via globalWritesCallArgs(..., false).
+		return a.globalWritesCallArgs(c, false)
 	}
 	if isSyncMutexMethod(callee) || isRWMutexMethod(callee) {
 		return nil
 	}
 	if isWhitelistedSyncMethod(callee, recvOfCall(c)) {
+		return nil
+	}
+	if isAtomicCallee(callee) || isStdlibReadOnlyCall(callee) {
 		return nil
 	}
 	if callee.Pkg == a.pkg && len(callee.Blocks) > 0 {

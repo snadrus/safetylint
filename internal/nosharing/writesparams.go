@@ -8,7 +8,7 @@ import (
 // exportParamWriteFacts publishes WritesParams on functions in this package
 // so other packages can decide whether a pointer call mutates its argument.
 func (a *analyzer) exportParamWriteFacts() {
-	if a.pass == nil {
+	if a.pass == nil || !factsEnabled() {
 		return
 	}
 	for _, fn := range a.funcs {

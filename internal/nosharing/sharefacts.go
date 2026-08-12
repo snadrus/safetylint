@@ -88,7 +88,7 @@ func (a *analyzer) exportShareFacts() {
 		// Publish only exported APIs that retain params. Bare MaySpawn is
 		// unnecessary for freeze (Fact-less cross-pkg calls stay spawn points)
 		// and would clutter analysistest expectations.
-		if obj.Exported() && len(fact.Params) > 0 {
+		if factsEnabled() && obj.Exported() && len(fact.Params) > 0 {
 			a.pass.ExportObjectFact(obj, fact)
 		}
 	}
@@ -548,7 +548,7 @@ func (a *analyzer) checkShareEvent(callFn *ssa.Function, callInstr ssa.Instructi
 	seen := map[ssa.Instruction]bool{}
 	visiting := map[ssa.Value]bool{}
 	for _, r := range roots {
-		if isChanType(r.val.Type()) || isWhitelistedSync(r.val) || isSyncMutex(r.val) {
+		if isChanType(r.val.Type()) || isWhitelistedSync(r.val) || isSyncMutex(r.val) || isShareSafeStdlib(r.val) {
 			continue
 		}
 		for _, acc := range collectDataAccessesDeep(r.val, allFuncs, visiting) {

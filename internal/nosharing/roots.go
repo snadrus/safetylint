@@ -81,11 +81,21 @@ func collectRoots(g *ssa.Go, callee *ssa.Function, globals map[*ssa.Global]bool)
 // free vars and their bindings. Needed so a tied-mutex proof sees every
 // touchpoint after memory enters a shareable state (not only the go-site
 // Param/FreeVar).
+//
+// Alias growth is capped: beyond maxRootAliases the mutex proof fails closed
+// (incomplete alias set) rather than exploding on large packages.
+const maxRootAliases = 128
+
 func expandRootAliases(roots []sharedRoot, funcs map[*ssa.Function]bool) []sharedRoot {
 	seen := map[ssa.Value]bool{}
 	var out []sharedRoot
+	capped := false
 	add := func(v ssa.Value, reason string) {
-		if v == nil || seen[v] {
+		if v == nil || seen[v] || capped {
+			return
+		}
+		if len(out) >= maxRootAliases {
+			capped = true
 			return
 		}
 		seen[v] = true
@@ -96,11 +106,11 @@ func expandRootAliases(roots []sharedRoot, funcs map[*ssa.Function]bool) []share
 		add(stripToObject(r.val), r.reason)
 	}
 
-	for changed := true; changed; {
+	for changed := true; changed && !capped; {
 		changed = false
 		before := len(seen)
 		for fn := range funcs {
-			if fn == nil {
+			if fn == nil || capped {
 				continue
 			}
 			for _, b := range fn.Blocks {
@@ -200,7 +210,9 @@ func sameObjectRoot(v ssa.Value) ssa.Value {
 		case *ssa.Slice:
 			v = x.X
 		case *ssa.Extract:
-			v = x.Tuple
+			// Multi-return extracts are distinct values (e.g. ctx vs cancel
+			// from context.WithCancel); the SSA tuple is not one object.
+			return v
 		case *ssa.Alloc, *ssa.Parameter, *ssa.FreeVar, *ssa.Global:
 			return v
 		default:

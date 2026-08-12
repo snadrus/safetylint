@@ -162,10 +162,16 @@ func hasWriteNotBefore(root ssa.Value, fn *ssa.Function, g *ssa.Go) bool {
 // deriveAddrs collects addresses/values derived from root within funcs.
 // It scans instructions directly (rather than walking Referrers) so that
 // Global roots, which do not track referrers, are handled uniformly.
+// Growth is capped to avoid pathological alias explosion on large packages.
+const maxDeriveAddrs = 4096
+
 func deriveAddrs(root ssa.Value, funcs map[*ssa.Function]bool) map[ssa.Value]bool {
 	out := map[ssa.Value]bool{root: true}
 	for changed := true; changed; {
 		changed = false
+		if len(out) >= maxDeriveAddrs {
+			break
+		}
 		for fn := range funcs {
 			if fn == nil {
 				continue
@@ -179,6 +185,9 @@ func deriveAddrs(root ssa.Value, funcs map[*ssa.Function]bool) map[ssa.Value]boo
 					if derivesFrom(instr, out) {
 						out[v] = true
 						changed = true
+						if len(out) >= maxDeriveAddrs {
+							return out
+						}
 					}
 				}
 			}
@@ -376,6 +385,15 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 
 	callee := c.StaticCallee()
 	if callee != nil {
+		if isShareSafeStdlib(v) {
+			return false
+		}
+		if isAtomicCallee(callee) {
+			return false
+		}
+		if isStdlibReadOnlyCall(callee) {
+			return false
+		}
 		if isWhitelistedSyncMethod(callee, v) {
 			return false
 		}
@@ -401,6 +419,9 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 		return false
 	}
 
+	if isShareSafeStdlib(v) {
+		return false
+	}
 	if pessimistic && argOrRecvIs(c, v) {
 		return true
 	}
@@ -454,7 +475,49 @@ func receiverIs(c *ssa.CallCommon, v ssa.Value) bool {
 }
 
 func isWhitelistedSync(v ssa.Value) bool {
-	return isNamedSyncType(v.Type(), "WaitGroup", "Once")
+	return isNamedSyncType(v.Type(), "WaitGroup", "Once", "Map")
+}
+
+// isShareSafeStdlib reports values whose stdlib type is designed for safe
+// concurrent sharing without a caller-held sync.Mutex (context.Context and
+// *net/http.Server's Serve/Shutdown protocol).
+func isShareSafeStdlib(v ssa.Value) bool {
+	if v == nil {
+		return false
+	}
+	return isContextType(v.Type()) || isHTTPServerType(v.Type())
+}
+
+func isContextType(t types.Type) bool {
+	t = types.Unalias(t)
+	// Closure captures of interfaces are *Context.
+	if p, ok := t.(*types.Pointer); ok {
+		t = types.Unalias(p.Elem())
+	}
+	n, ok := t.(*types.Named)
+	if !ok {
+		return false
+	}
+	obj := n.Obj()
+	return obj != nil && obj.Pkg() != nil && obj.Pkg().Path() == "context" && obj.Name() == "Context"
+}
+
+func isHTTPServerType(t types.Type) bool {
+	t = types.Unalias(t)
+	// FreeVar of *Server is **Server.
+	for {
+		p, ok := t.(*types.Pointer)
+		if !ok {
+			break
+		}
+		t = types.Unalias(p.Elem())
+	}
+	n, ok := t.(*types.Named)
+	if !ok {
+		return false
+	}
+	obj := n.Obj()
+	return obj != nil && obj.Pkg() != nil && obj.Pkg().Path() == "net/http" && obj.Name() == "Server"
 }
 
 func isMutexLike(v ssa.Value) bool {
@@ -498,6 +561,8 @@ func isWhitelistedSyncMethod(fn *ssa.Function, recv ssa.Value) bool {
 		return recvMatches("WaitGroup") || recvTypeIs(fn, "WaitGroup")
 	case "Do":
 		return recvMatches("Once") || recvTypeIs(fn, "Once")
+	case "Load", "Store", "LoadOrStore", "LoadAndDelete", "Delete", "Swap", "CompareAndSwap", "Range", "Clear":
+		return recvMatches("Map") || recvTypeIs(fn, "Map")
 	}
 	return false
 }

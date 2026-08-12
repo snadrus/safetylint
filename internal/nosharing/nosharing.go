@@ -4,7 +4,7 @@
 //
 // Provably read-only sharing is allowed. sync.WaitGroup, sync.Once, and
 // sync.Mutex (as a lock object) are whitelisted as pure synchronization.
-// RWMutex-guarded data sharing is refused. TryLock only counts on paths
+// RWMutex-guarded data sharing is refused (sync.Mutex is just as fast). TryLock only counts on paths
 // where its boolean result is proven true.
 //
 // Cross-package: functions that spawn and retain parameters export
@@ -26,6 +26,8 @@ import (
 	"os"
 	"strings"
 
+	"safetylint/internal/toolver"
+
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/ssa"
@@ -37,14 +39,15 @@ The nosharing analyzer proves the absence of data races under a channel-only
 sharing discipline, with a narrow exception for proven sync.Mutex guards:
 
   - Memory shared with a goroutine via capture, argument, or global must be
-    provably read-only, be *sync.WaitGroup / *sync.Once / *sync.Mutex, or be
+    provably read-only, be *sync.WaitGroup / *sync.Once / *sync.Mutex, be
+    context.Context / *net/http.Server (stdlib concurrent protocols), or be
     guarded by one tied sync.Mutex field in the same (or parent) struct that
     is always locked at every access. TryLock only counts on paths where its
     boolean result is proven true.
   - Values may transfer between goroutines through channels. If a sent value
     contains pointers, those pointees are frozen after send: no further writes
     through the sender's or receiver's view of that memory are allowed.
-  - sync.RWMutex-guarded sharing is refused.
+  - sync.RWMutex-guarded sharing is refused — sync.Mutex is just as fast.
   - In packages that spawn goroutines, package globals are frozen once
     concurrency may have begun: writes are allowed only in init functions,
     in main before the first spawn point (go, dynamic/interface call,
@@ -55,7 +58,8 @@ sharing discipline, with a narrow exception for proven sync.Mutex guards:
     Facts. Call sites must treat those arguments as shared: no post-call
     writes unless under the Fact's tied sync.Mutex. Wrappers re-export Facts.
   - Curated async stdlib APIs (time.AfterFunc, http.HandleFunc, …) share
-    closure captures like Fact-bearing calls.
+    closure captures like Fact-bearing calls. Toolchains newer than this
+    tool's verified Go version warn that new standard funcs may be unverified.
   - If init starts concurrency, main and other non-init code are already
     post-spawn for global freeze. Globals touched by init goroutines are
     published as package HotGlobals Facts (optional tied mutex). Init
@@ -93,6 +97,16 @@ func run(pass *analysis.Pass) (any, error) {
 	if packageInGOROOT(pass) {
 		return nil, nil
 	}
+	if only := os.Getenv("SAFETYLINT_ONLY"); only != "" {
+		path := pass.Pkg.Path()
+		if path != only && !strings.HasPrefix(path, only+"/") {
+			return nil, nil
+		}
+	}
+	toolver.WarnIfTooNew(pass)
+	if os.Getenv("SAFETYLINT_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "nosharing: analyzing %s facts=%v\n", pass.Pkg.Path(), factsEnabled())
+	}
 	ssainfo := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 	a := &analyzer{
 		pass:       pass,
@@ -106,6 +120,9 @@ func run(pass *analysis.Pass) (any, error) {
 		return nil, nil
 	}
 	a.run()
+	if os.Getenv("SAFETYLINT_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "nosharing: done %s\n", pass.Pkg.Path())
+	}
 	return nil, nil
 }
 
@@ -181,12 +198,18 @@ func (a *analyzer) run() {
 		a.checkChannelFreeze(fn, reported)
 	}
 
-	a.exportShareFacts()
-	a.exportHotGlobals()
+	if factsEnabled() {
+		a.exportShareFacts()
+		a.exportHotGlobals()
+	}
 	a.checkShareFactCalls(reported)
 	a.checkAsyncCallbackShares(reported)
 	a.checkGlobalFreeze(reported)
 	a.checkHotGlobalAccesses(reported)
+}
+
+func factsEnabled() bool {
+	return os.Getenv("SAFETYLINT_NO_FACTS") != "1"
 }
 
 func (a *analyzer) reportAt(reported map[string]bool, pos token.Pos, format string, args ...any) {
@@ -215,15 +238,18 @@ func (a *analyzer) checkGo(g *ssa.Go, spawner *ssa.Function, globals map[*ssa.Gl
 		}
 	}
 	roots = expandRootAliases(roots, allFuncs)
-	reachable := reachableFuncs(callee, a.pkg)
+	// Explore the callee's package so cross-package go targets (e.g. s.Run)
+	// still see writes inside the started goroutine.
+	reachable := reachableFuncs(callee, callee.Pkg)
 	seen := map[string]bool{}
 
 	for _, root := range roots {
 		if isChanType(root.val.Type()) {
 			continue
 		}
-		if isWhitelistedSync(root.val) || isSyncMutex(root.val) {
+		if isWhitelistedSync(root.val) || isSyncMutex(root.val) || isShareSafeStdlib(root.val) {
 			// WaitGroup/Once/Mutex objects are pure synchronization.
+			// context.Context and *http.Server are stdlib-safe to share.
 			continue
 		}
 		if isSyncRWMutex(root.val) {
@@ -232,7 +258,7 @@ func (a *analyzer) checkGo(g *ssa.Go, spawner *ssa.Function, globals map[*ssa.Gl
 				continue
 			}
 			seen[key] = true
-			a.reportAt(reported, g.Pos(), "shared sync.RWMutex %s: RWMutex-guarded sharing refused (use channels or sync.Mutex)",
+			a.reportAt(reported, g.Pos(), "shared sync.RWMutex %s: RWMutex-guarded sharing refused — sync.Mutex is just as fast (or use channels)",
 				root.describe())
 			continue
 		}
@@ -263,8 +289,13 @@ func (a *analyzer) checkGo(g *ssa.Go, spawner *ssa.Function, globals map[*ssa.Gl
 				continue
 			}
 			seen[key] = true
-			a.reportAt(reported, g.Pos(), "shared memory %s written without channel transfer and no always-locked sync.Mutex guard (%s)",
-				root.describe(), root.reason)
+			if hasStructuralRWMutex(root.val) {
+				a.reportAt(reported, g.Pos(), "shared RWMutex-guarded memory %s: RWMutex-guarded sharing refused — sync.Mutex is just as fast (or use channels) (%s)",
+					root.describe(), root.reason)
+			} else {
+				a.reportAt(reported, g.Pos(), "shared memory %s written without channel transfer and no always-locked sync.Mutex guard (%s)",
+					root.describe(), root.reason)
+			}
 		}
 	}
 }

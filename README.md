@@ -37,6 +37,8 @@ doubt, it **rejects**):
    - no `.s` assembly in the package
    - no `//go:linkname` or `//go:cgo_*` directives
    - no `reflect` pointer laundering (`UnsafePointer`, `SliceHeader`, …)
+   - Escape-hatch hits report that the code is **not verified**: check its
+     safety and the adapter's safety yourself.
 
 2. **No racy shared memory** (`nosharing`)
    - Memory shared with a goroutine via capture, argument, or global must be
@@ -55,7 +57,8 @@ doubt, it **rejects**):
    - If a sent value contains pointers, those pointees are **frozen after
      send**: neither sender nor receiver may write through them afterward.
    - Pointer-free values copied by a channel may be mutated freely after send.
-   - `sync.RWMutex`-guarded sharing is **refused**.
+   - `sync.RWMutex`-guarded sharing is **refused** (`sync.Mutex` is just as
+     fast; or use channels).
 
 3. **Globals are init-then-freeze** (`nosharing`)
 
@@ -142,7 +145,7 @@ safetylint prefers false rejections over missed races:
   result is proven true acquire the guard.
 - Only **struct-embedded** `sync.Mutex` fields guard data; free-standing
   mutexes do not.
-- `sync.RWMutex` is never accepted as a guard.
+- `sync.RWMutex` is never accepted as a guard (`sync.Mutex` is just as fast).
 - Ownership hand-off where the **receiver** mutates channel-sent pointers is
   rejected (freeze-after-send, not transfer-of-mutability).
 - Dynamic `go` callees (interfaces / function values) are rejected.
@@ -153,6 +156,8 @@ safetylint prefers false rejections over missed races:
 - Stdlib / GOROOT packages are skipped for Fact export; curated async APIs
   (`time.AfterFunc`, `http.HandleFunc`, …) still share callback captures.
   Other hidden stdlib spawn+retain APIs remain a limitation until listed.
+  Running on a Go toolchain newer than this tool's verified version warns
+  that faults via new standard funcs may be possible.
 - Exported functions in library packages may never write plain globals once
   the package spawns goroutines anywhere: other packages could call them
   concurrently.

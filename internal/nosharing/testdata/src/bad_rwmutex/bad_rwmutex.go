@@ -15,6 +15,6 @@ func (c *Counter) Inc() {
 
 func Run() {
 	c := &Counter{}
-	go c.Inc() // want `shared memory .* written without channel transfer and no always-locked sync.Mutex guard|shared sync.RWMutex`
+	go c.Inc() // want `RWMutex-guarded sharing refused — sync.Mutex is just as fast`
 	c.Inc()
 }

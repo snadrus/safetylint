@@ -37,6 +37,9 @@ func TestNosharing(t *testing.T) {
 		"good_globalmain",
 		"good_globalmutex",
 		"good_global_read",
+		"good_global_atomic",
+		"good_global_errmethod",
+		"good_global_mapsvalues",
 		"bad_global_httpserve",
 		"sharero",
 		"sharemu",
@@ -56,5 +59,7 @@ func TestNosharing(t *testing.T) {
 		"bad_init_xpkg_readhot",
 		"good_init_xpkg",
 		"good_init_xpkg_read",
+		"good_context",
+		"good_httpserver",
 	)
 }
