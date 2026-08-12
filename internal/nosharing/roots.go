@@ -129,12 +129,17 @@ func expandRootAliases(roots []sharedRoot, funcs map[*ssa.Function]bool) []share
 							continue
 						}
 						for i, bind := range in.Bindings {
-							if !seen[bind] && !seen[stripToObject(bind)] {
+							if i >= len(f.FreeVars) {
 								continue
 							}
-							if i < len(f.FreeVars) {
-								add(f.FreeVars[i], "alias of shared capture")
+							fv := f.FreeVars[i]
+							// Expand from binding→freevar or freevar→binding so
+							// sibling closures capturing the same object share
+							// one alias set (needed for partition proofs).
+							if !seen[bind] && !seen[stripToObject(bind)] && !seen[fv] {
+								continue
 							}
+							add(fv, "alias of shared capture")
 							add(bind, "alias of shared capture")
 							add(stripToObject(bind), "alias of shared capture")
 						}

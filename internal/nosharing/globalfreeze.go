@@ -107,7 +107,7 @@ func (a *analyzer) checkGlobalFreeze(reported map[string]bool) {
 				}
 				for _, gl := range gls {
 					if mutexOK[gl] == 0 {
-						if len(findStructuralGuards(gl)) > 0 && mutexGuardsAccesses(gl, allFuncs) {
+						if mutexGuardsAccesses(gl, allFuncs) {
 							mutexOK[gl] = 1
 						} else {
 							mutexOK[gl] = 2

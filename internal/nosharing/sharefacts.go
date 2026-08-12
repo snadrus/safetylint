@@ -579,7 +579,18 @@ func (a *analyzer) checkShareEvent(callFn *ssa.Function, callInstr ssa.Instructi
 		return
 	}
 
-	// No tied mutex: refuse any write after the share event.
+	// No Fact-tied mutex: allow if the cascade proves a guard (free-standing,
+	// RWMutex, atomics-only, or partitioned writers) over post-share accesses.
+	for _, r := range roots {
+		if isChanType(r.val.Type()) || isWhitelistedSync(r.val) || isSyncMutex(r.val) || isShareSafeStdlib(r.val) {
+			continue
+		}
+		if accessesGuarded(r.val, accesses, allFuncs) {
+			return
+		}
+	}
+
+	// Refuse any write after the share event.
 	for _, acc := range accesses {
 		if isWriteAccess(acc) {
 			a.reportAt(reported, pos, "shared memory from Fact-bearing call written after share (callee may retain it concurrently)")
@@ -600,14 +611,7 @@ func matchTiedGuard(roots []sharedRoot, m MutexField) (structuralGuard, bool) {
 }
 
 func isWriteAccess(acc dataAccess) bool {
-	switch acc.instr.(type) {
-	case *ssa.Store, *ssa.MapUpdate:
-		return true
-	case *ssa.Call, *ssa.Defer, *ssa.Go:
-		return true // escaping call counted as potential write
-	default:
-		return false
-	}
+	return acc.write
 }
 
 // accessAfterShare reports whether instr may execute after the share call

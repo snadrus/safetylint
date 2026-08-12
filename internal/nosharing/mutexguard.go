@@ -7,13 +7,21 @@ import (
 	"golang.org/x/tools/go/ssa"
 )
 
-// guardKey identifies a sync.Mutex field of a particular base object within
-// one function's SSA. Two sites refer to the same guard only when their
-// bases are the same Alloc/Param/FreeVar/Global (after stripping).
+// guardKey identifies a sync.Mutex / sync.RWMutex guard within one function's
+// SSA. field >= 0 is a struct field of base; field == -1 is a free-standing
+// package-level Mutex/RWMutex Global (base itself).
 type guardKey struct {
 	base  ssa.Value
 	field int
 }
+
+// holdMode is the strength of a must-held guard.
+type holdMode uint8
+
+const (
+	holdRead  holdMode = 1 // RLock (or better)
+	holdWrite holdMode = 2 // Lock / exclusive
+)
 
 // structuralGuard is a mutex field of a named/anonymous struct type,
 // independent of any particular SSA base. Used to record which field
@@ -21,11 +29,22 @@ type guardKey struct {
 type structuralGuard struct {
 	structType types.Type // the struct (not pointer) containing the mutex
 	field      int
+	rw         bool // sync.RWMutex field (vs sync.Mutex)
 }
 
 // findStructuralGuards returns sync.Mutex fields in the struct pointed at
 // by root, and in any parent structs visible via a FieldAddr chain.
 func findStructuralGuards(root ssa.Value) []structuralGuard {
+	return findStructuralGuardsKind(root, false)
+}
+
+// findStructuralRWGuards returns sync.RWMutex fields in the struct pointed at
+// by root, and in any parent structs visible via a FieldAddr chain.
+func findStructuralRWGuards(root ssa.Value) []structuralGuard {
+	return findStructuralGuardsKind(root, true)
+}
+
+func findStructuralGuardsKind(root ssa.Value, rw bool) []structuralGuard {
 	var out []structuralGuard
 	seen := map[string]bool{} // type+field dedupe
 	add := func(structT types.Type, field int) {
@@ -34,17 +53,19 @@ func findStructuralGuards(root ssa.Value) []structuralGuard {
 			return
 		}
 		seen[key] = true
-		out = append(out, structuralGuard{structType: structT, field: field})
+		out = append(out, structuralGuard{structType: structT, field: field, rw: rw})
+	}
+	fieldsOf := mutexFields
+	if rw {
+		fieldsOf = rwMutexFields
 	}
 
-	// Mutexes in the type root points to.
 	if st := structOf(root.Type()); st != nil {
-		for _, fi := range mutexFields(st) {
+		for _, fi := range fieldsOf(st) {
 			add(st, fi)
 		}
 	}
 
-	// Walk outward through FieldAddr parents.
 	for cur := root; cur != nil; {
 		switch v := cur.(type) {
 		case *ssa.UnOp:
@@ -61,7 +82,7 @@ func findStructuralGuards(root ssa.Value) []structuralGuard {
 			continue
 		case *ssa.FieldAddr:
 			if st := structOf(v.X.Type()); st != nil {
-				for _, fi := range mutexFields(st) {
+				for _, fi := range fieldsOf(st) {
 					add(st, fi)
 				}
 			}
@@ -76,70 +97,17 @@ func findStructuralGuards(root ssa.Value) []structuralGuard {
 }
 
 // mutexGuardsGoRoots proves that every data access through any of the go's
-// shared roots is covered by one consistent tied sync.Mutex field in the
-// same/parent struct (the same structural guard at every touchpoint,
-// including same-package callees).
+// shared roots is covered by the north-star guard cascade (tied Mutex,
+// free-standing package Mutex/RWMutex, RWMutex discipline, atomics-only,
+// or const-index partitioned writers).
 func mutexGuardsGoRoots(roots []sharedRoot, funcs map[*ssa.Function]bool) bool {
-	var candidates []structuralGuard
-	seenCand := map[string]bool{}
-	var accesses []dataAccess
-	seenAcc := map[ssa.Instruction]bool{}
-	visiting := map[ssa.Value]bool{}
-
-	// Too many aliases ⇒ incomplete/pathological set; fail closed without
-	// quadratic deep access collection that can hang on large packages.
-	if len(roots) >= maxRootAliases {
-		return false
-	}
-	for _, root := range roots {
-		if isChanType(root.val.Type()) || isWhitelistedSync(root.val) || isSyncMutex(root.val) || isSyncRWMutex(root.val) || isShareSafeStdlib(root.val) {
-			continue
-		}
-		for _, c := range findStructuralGuards(root.val) {
-			key := c.structType.String() + "#" + itoa(c.field)
-			if seenCand[key] {
-				continue
-			}
-			seenCand[key] = true
-			candidates = append(candidates, c)
-		}
-		for _, acc := range collectDataAccessesDeep(root.val, funcs, visiting) {
-			if seenAcc[acc.instr] {
-				continue
-			}
-			seenAcc[acc.instr] = true
-			accesses = append(accesses, acc)
-		}
-	}
-	if len(candidates) == 0 {
-		return false
-	}
-	if len(accesses) == 0 {
-		return true
-	}
-	return hasTiedMutex(candidates, accesses)
+	return objectGuardedRoots(roots, funcs)
 }
 
 // mutexGuardsAccesses reports whether every load/store of root's memory in
-// funcs happens while one consistent tied sync.Mutex (same or parent struct
-// field) is held at every touchpoint.
+// funcs is covered by the north-star guard cascade.
 func mutexGuardsAccesses(root ssa.Value, funcs map[*ssa.Function]bool) bool {
-	return mutexGuardsAccessesRec(root, funcs, map[ssa.Value]bool{})
-}
-
-func mutexGuardsAccessesRec(root ssa.Value, funcs map[*ssa.Function]bool, visiting map[ssa.Value]bool) bool {
-	if root == nil || visiting[root] {
-		return true
-	}
-	candidates := findStructuralGuards(root)
-	accesses := collectDataAccessesDeep(root, funcs, visiting)
-	if len(candidates) == 0 {
-		return len(accesses) == 0
-	}
-	if len(accesses) == 0 {
-		return true
-	}
-	return hasTiedMutex(candidates, accesses)
+	return objectGuarded(root, funcs)
 }
 
 // hasTiedMutex reports whether there exists one structural mutex field that
@@ -151,7 +119,7 @@ func hasTiedMutex(candidates []structuralGuard, accesses []dataAccess) bool {
 
 // findTiedMutex returns one structural mutex field that protects every access.
 func findTiedMutex(candidates []structuralGuard, accesses []dataAccess) (structuralGuard, bool) {
-	heldCache := map[*ssa.Function]map[ssa.Instruction]map[guardKey]bool{}
+	heldCache := map[*ssa.Function]map[ssa.Instruction]holdSet{}
 	for _, c := range candidates {
 		ok := true
 		for _, acc := range accesses {
@@ -177,6 +145,9 @@ func findTiedMutex(candidates []structuralGuard, accesses []dataAccess) (structu
 	}
 	return structuralGuard{}, false
 }
+
+// holdSet is the must-held guards at a program point (mode = read or write).
+type holdSet map[guardKey]holdMode
 
 // collectDataAccessesDeep collects data accesses through root and through
 // same-package callees that receive root-derived values, so a single tied
@@ -244,10 +215,11 @@ func collectDataAccessesDeep(root ssa.Value, funcs map[*ssa.Function]bool, visit
 type dataAccess struct {
 	instr ssa.Instruction
 	addr  ssa.Value // address or map value being accessed
+	write bool
 }
 
 // collectDataAccesses finds loads and stores through root (excluding
-// accesses that are solely the sync.Mutex field used for Lock/Unlock).
+// accesses that are solely the sync.Mutex/RWMutex field used for Lock/Unlock).
 // It scans instructions directly so Global roots (which lack Referrers)
 // are handled uniformly.
 func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAccess {
@@ -255,7 +227,7 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 	seen := map[ssa.Instruction]bool{}
 	derived := deriveAddrs(root, funcs)
 
-	add := func(instr ssa.Instruction, addr ssa.Value) {
+	add := func(instr ssa.Instruction, addr ssa.Value, write bool) {
 		if instr == nil || seen[instr] {
 			return
 		}
@@ -263,31 +235,31 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 			return
 		}
 		seen[instr] = true
-		out = append(out, dataAccess{instr: instr, addr: addr})
+		out = append(out, dataAccess{instr: instr, addr: addr, write: write})
 	}
 
 	checkCall := func(instr ssa.Instruction, c *ssa.CallCommon) {
-		if isMutexLockUnlockCall(c) {
+		if isMutexGuardCall(c) {
 			return
 		}
 		if cal := c.StaticCallee(); cal != nil {
-			if isWhitelistedSyncMethod(cal, recvOfCall(c)) || isRWMutexMethod(cal) {
+			if isWhitelistedSyncMethod(cal, recvOfCall(c)) || isRWMutexMethod(cal) || isSyncMutexMethod(cal) {
 				return
 			}
 			if len(cal.Blocks) > 0 && instr.Parent() != nil && cal.Pkg == instr.Parent().Pkg {
 				// Same-package callees are checked via their own parameters
-				// in calleeParamsGuarded.
+				// in collectDataAccessesDeep.
 				return
 			}
 		}
 		for _, arg := range c.Args {
 			if derived[arg] && !isMutexFieldAddr(arg) {
-				add(instr, arg)
+				add(instr, arg, true)
 				return
 			}
 		}
 		if c.IsInvoke() && derived[c.Value] {
-			add(instr, c.Value)
+			add(instr, c.Value, true)
 		}
 	}
 
@@ -300,23 +272,23 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 				switch in := instr.(type) {
 				case *ssa.Store:
 					if derived[in.Addr] {
-						add(in, in.Addr)
+						add(in, in.Addr, true)
 					}
 				case *ssa.UnOp:
 					if in.Op == token.MUL && derived[in.X] {
-						add(in, in.X)
+						add(in, in.X, false)
 					}
 				case *ssa.MapUpdate:
 					if derived[in.Map] {
-						add(in, in.Map)
+						add(in, in.Map, true)
 					}
 				case *ssa.Lookup:
 					if derived[in.X] {
-						add(in, in.X)
+						add(in, in.X, false)
 					}
 				case *ssa.Range:
 					if derived[in.X] {
-						add(in, in.X)
+						add(in, in.X, false)
 					}
 				case *ssa.Call:
 					checkCall(in, in.Common())
@@ -331,9 +303,12 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 	return out
 }
 
-func accessProtectedBy(acc dataAccess, held map[guardKey]bool, tied structuralGuard) bool {
+func accessProtectedBy(acc dataAccess, held holdSet, tied structuralGuard) bool {
 	tiedKey := tied.structType.String() + "#" + itoa(tied.field)
-	for g := range held {
+	for g, mode := range held {
+		if g.field < 0 {
+			continue
+		}
 		st := structOf(g.base.Type())
 		if st == nil {
 			continue
@@ -341,11 +316,25 @@ func accessProtectedBy(acc dataAccess, held map[guardKey]bool, tied structuralGu
 		if st.String()+"#"+itoa(g.field) != tiedKey {
 			continue
 		}
+		if !modeOKForAccess(mode, acc.write, tied.rw) {
+			continue
+		}
 		if baseCoversAddr(g.base, acc.addr) {
 			return true
 		}
 	}
 	return false
+}
+
+func modeOKForAccess(mode holdMode, write, rw bool) bool {
+	if write {
+		return mode == holdWrite
+	}
+	if rw {
+		return mode == holdRead || mode == holdWrite
+	}
+	// sync.Mutex: reads also require Lock.
+	return mode == holdWrite
 }
 
 // baseCoversAddr reports whether base is the object identity of addr or of
@@ -379,14 +368,19 @@ func baseCoversAddr(base, addr ssa.Value) bool {
 	return false
 }
 
+// tryAcq is a TryLock/TryRLock result that acquires a guard on the true path.
+type tryAcq struct {
+	g    guardKey
+	mode holdMode
+}
+
 // analyzeMustHold returns, for each instruction, the set of guards that are
 // definitely held just before that instruction executes.
 //
-// Lock acquires immediately. TryLock acquires only on CFG edges where its
-// boolean result is proven true (e.g. the true branch of `if mu.TryLock()`,
-// or the false branch of `if !ok` after `ok := mu.TryLock()`).
-func analyzeMustHold(fn *ssa.Function) map[ssa.Instruction]map[guardKey]bool {
-	result := map[ssa.Instruction]map[guardKey]bool{}
+// Lock/RLock acquire immediately. TryLock/TryRLock acquire only on CFG edges
+// where their boolean result is proven true.
+func analyzeMustHold(fn *ssa.Function) map[ssa.Instruction]holdSet {
+	result := map[ssa.Instruction]holdSet{}
 	if fn == nil || len(fn.Blocks) == 0 {
 		return result
 	}
@@ -394,29 +388,25 @@ func analyzeMustHold(fn *ssa.Function) map[ssa.Instruction]map[guardKey]bool {
 	universe := discoverGuardsInFunc(fn)
 	tryResults := discoverTryLockResults(fn)
 
-	// blockOut[b] = held set after the last instruction of b.
-	blockOut := make([]map[guardKey]bool, len(fn.Blocks))
-	blockIn := make([]map[guardKey]bool, len(fn.Blocks))
+	blockOut := make([]holdSet, len(fn.Blocks))
+	blockIn := make([]holdSet, len(fn.Blocks))
 
-	// TOP = full universe for must-analysis initialization.
+	// TOP = full universe at exclusive strength for must-analysis init.
 	top := cloneGuardSet(universe)
 	for i := range fn.Blocks {
 		blockIn[fn.Blocks[i].Index] = cloneGuardSet(top)
 		blockOut[fn.Blocks[i].Index] = cloneGuardSet(top)
 	}
-	// Ensure entry is empty.
 	entry := fn.Blocks[0]
-	blockIn[entry.Index] = map[guardKey]bool{}
+	blockIn[entry.Index] = holdSet{}
 
 	changed := true
 	for changed {
 		changed = false
 		for _, b := range fn.Blocks {
-			// IN[b] = intersection of edge-outs from preds (TryLock may gen
-			// on the true/false edge after an If on its result).
-			var in map[guardKey]bool
+			var in holdSet
 			if len(b.Preds) == 0 {
-				in = map[guardKey]bool{}
+				in = holdSet{}
 			} else {
 				in = edgeHold(b.Preds[0], b, blockOut, tryResults)
 				for _, p := range b.Preds[1:] {
@@ -430,7 +420,6 @@ func analyzeMustHold(fn *ssa.Function) map[ssa.Instruction]map[guardKey]bool {
 
 			cur := cloneGuardSet(in)
 			for _, instr := range b.Instrs {
-				// Record held-before instruction.
 				result[instr] = cloneGuardSet(cur)
 				cur = transferHold(cur, instr, universe)
 			}
@@ -443,24 +432,31 @@ func analyzeMustHold(fn *ssa.Function) map[ssa.Instruction]map[guardKey]bool {
 	return result
 }
 
-// discoverTryLockResults maps SSA values that are the boolean result of a
-// structural sync.Mutex.TryLock to the guard that would be held on success.
-func discoverTryLockResults(fn *ssa.Function) map[ssa.Value]guardKey {
-	out := map[ssa.Value]guardKey{}
+// discoverTryLockResults maps SSA values that are the boolean result of
+// TryLock/TryRLock to the guard+mode held on success.
+func discoverTryLockResults(fn *ssa.Function) map[ssa.Value]tryAcq {
+	out := map[ssa.Value]tryAcq{}
 	for _, b := range fn.Blocks {
 		for _, instr := range b.Instrs {
 			call, ok := instr.(*ssa.Call)
 			if !ok {
 				continue
 			}
-			if mutexMethodName(call.Common()) != "TryLock" {
+			name := mutexMethodName(call.Common())
+			var mode holdMode
+			switch name {
+			case "TryLock":
+				mode = holdWrite
+			case "TryRLock":
+				mode = holdRead
+			default:
 				continue
 			}
 			g, ok := lockUnlockGuard(call.Common())
 			if !ok {
 				continue
 			}
-			out[call] = g
+			out[call] = tryAcq{g: g, mode: mode}
 		}
 	}
 	return out
@@ -468,7 +464,7 @@ func discoverTryLockResults(fn *ssa.Function) map[ssa.Value]guardKey {
 
 // edgeHold is the held set flowing from pred into succ, including TryLock
 // acquisition on the branch where the TryLock result is proven true.
-func edgeHold(pred, succ *ssa.BasicBlock, blockOut []map[guardKey]bool, tryResults map[ssa.Value]guardKey) map[guardKey]bool {
+func edgeHold(pred, succ *ssa.BasicBlock, blockOut []holdSet, tryResults map[ssa.Value]tryAcq) holdSet {
 	out := cloneGuardSet(blockOut[pred.Index])
 	if len(pred.Instrs) == 0 {
 		return out
@@ -477,25 +473,23 @@ func edgeHold(pred, succ *ssa.BasicBlock, blockOut []map[guardKey]bool, tryResul
 	if !ok {
 		return out
 	}
-	g, heldOnTrue, ok := tryLockCond(iff.Cond, tryResults)
+	acq, heldOnTrue, ok := tryLockCond(iff.Cond, tryResults)
 	if !ok {
 		return out
 	}
 	isTrueSucc := len(pred.Succs) > 0 && pred.Succs[0] == succ
 	isFalseSucc := len(pred.Succs) > 1 && pred.Succs[1] == succ
 	if heldOnTrue && isTrueSucc {
-		out[g] = true
+		strengthenHold(out, acq.g, acq.mode)
 	}
 	if !heldOnTrue && isFalseSucc {
-		out[g] = true
+		strengthenHold(out, acq.g, acq.mode)
 	}
 	return out
 }
 
-// tryLockCond reports whether cond is a TryLock result (possibly negated).
-// heldOnTrue means the If-true successor acquires the guard; otherwise the
-// If-false successor does (cond is a negation of the TryLock result).
-func tryLockCond(cond ssa.Value, tryResults map[ssa.Value]guardKey) (g guardKey, heldOnTrue bool, ok bool) {
+// tryLockCond reports whether cond is a TryLock/TryRLock result (possibly negated).
+func tryLockCond(cond ssa.Value, tryResults map[ssa.Value]tryAcq) (acq tryAcq, heldOnTrue bool, ok bool) {
 	negated := false
 	for cond != nil {
 		if tg, found := tryResults[cond]; found {
@@ -508,20 +502,20 @@ func tryLockCond(cond ssa.Value, tryResults map[ssa.Value]guardKey) (g guardKey,
 				cond = v.X
 				continue
 			}
-			return guardKey{}, false, false
+			return tryAcq{}, false, false
 		case *ssa.ChangeType:
 			cond = v.X
 		case *ssa.Convert:
 			cond = v.X
 		default:
-			return guardKey{}, false, false
+			return tryAcq{}, false, false
 		}
 	}
-	return guardKey{}, false, false
+	return tryAcq{}, false, false
 }
 
-func discoverGuardsInFunc(fn *ssa.Function) map[guardKey]bool {
-	u := map[guardKey]bool{}
+func discoverGuardsInFunc(fn *ssa.Function) holdSet {
+	u := holdSet{}
 	for _, b := range fn.Blocks {
 		for _, instr := range b.Instrs {
 			var common *ssa.CallCommon
@@ -535,28 +529,28 @@ func discoverGuardsInFunc(fn *ssa.Function) map[guardKey]bool {
 				continue
 			}
 			if g, ok := lockUnlockGuard(common); ok {
-				u[g] = true
+				// Universe uses exclusive strength as TOP for each guard.
+				u[g] = holdWrite
 			}
 		}
 	}
 	return u
 }
 
-func transferHold(in map[guardKey]bool, instr ssa.Instruction, universe map[guardKey]bool) map[guardKey]bool {
+func transferHold(in holdSet, instr ssa.Instruction, universe holdSet) holdSet {
 	out := cloneGuardSet(in)
 	switch in := instr.(type) {
 	case *ssa.Call:
 		applyCallHold(out, in.Common(), false, universe)
 	case *ssa.Defer:
-		// defer mu.Unlock() does not kill: it runs at return.
-		// defer mu.Lock() is pathological; ignore as gen too (would be wrong
-		// for the deferred region). Only immediate Lock gens.
+		// defer Unlock/RUnlock does not kill: it runs at return.
+		// defer Lock is pathological; ignore as gen too.
 		applyCallHold(out, in.Common(), true, universe)
 	}
 	return out
 }
 
-func applyCallHold(held map[guardKey]bool, c *ssa.CallCommon, isDefer bool, universe map[guardKey]bool) {
+func applyCallHold(held holdSet, c *ssa.CallCommon, isDefer bool, universe holdSet) {
 	if c == nil {
 		return
 	}
@@ -566,12 +560,16 @@ func applyCallHold(held map[guardKey]bool, c *ssa.CallCommon, isDefer bool, univ
 		switch name {
 		case "Lock":
 			if !isDefer {
-				held[g] = true
+				held[g] = holdWrite
 			}
-		case "TryLock":
+		case "RLock":
+			if !isDefer {
+				strengthenHold(held, g, holdRead)
+			}
+		case "TryLock", "TryRLock":
 			// Acquisition is modeled on the CFG edge where the boolean
 			// result is proven true; the call itself does not gen.
-		case "Unlock":
+		case "Unlock", "RUnlock":
 			if !isDefer {
 				delete(held, g)
 			}
@@ -587,7 +585,6 @@ func applyCallHold(held map[guardKey]bool, c *ssa.CallCommon, isDefer bool, univ
 
 	callee := c.StaticCallee()
 	if callee != nil && len(callee.Blocks) > 0 {
-		// Same-program callee with a body: kill only guards it may unlock.
 		for g := range held {
 			if calleeMayUnlock(callee, g, map[*ssa.Function]bool{}) {
 				delete(held, g)
@@ -596,14 +593,11 @@ func applyCallHold(held map[guardKey]bool, c *ssa.CallCommon, isDefer bool, univ
 		return
 	}
 	if callee != nil {
-		// Bodyless sync primitives cannot unlock our data guards.
 		if isSyncMutexMethod(callee) || isRWMutexMethod(callee) ||
 			isWhitelistedSyncMethod(callee, recvOfCall(c)) {
 			return
 		}
 	}
-	// Unknown or cross-package callee: kill guards whose base escapes as an
-	// argument, and guards rooted at exported globals (reachable anywhere).
 	for _, arg := range c.Args {
 		killEscaping(held, arg)
 	}
@@ -615,6 +609,13 @@ func applyCallHold(held map[guardKey]bool, c *ssa.CallCommon, isDefer bool, univ
 			delete(held, g)
 		}
 	}
+}
+
+func strengthenHold(held holdSet, g guardKey, mode holdMode) {
+	if cur, ok := held[g]; ok && cur >= mode {
+		return
+	}
+	held[g] = mode
 }
 
 // calleeMayUnlock reports whether fn (transitively, through same-program
@@ -646,21 +647,20 @@ func calleeMayUnlock(fn *ssa.Function, g guardKey, visited map[*ssa.Function]boo
 					continue
 				}
 			}
-			if isMutexLockUnlockCall(c) {
-				if mutexMethodName(c) != "Unlock" {
+			if isMutexGuardCall(c) {
+				name := mutexMethodName(c)
+				if name != "Unlock" && name != "RUnlock" {
 					continue
 				}
-				recv := mutexRecv(c)
-				fa, ok := recv.(*ssa.FieldAddr)
+				ug, ok := lockUnlockGuard(c)
 				if !ok {
 					return true // unlock through an alias we cannot identify
 				}
-				base := stripToObject(fa.X)
-				if base == g.base {
+				if ug.base == g.base && ug.field == g.field {
 					return true
 				}
-				if gStruct != nil {
-					if st := structOf(fa.X.Type()); st != nil && st.String() == gStruct.String() && fa.Field == g.field {
+				if g.field >= 0 && ug.field == g.field && gStruct != nil {
+					if st := structOf(ug.base.Type()); st != nil && st.String() == gStruct.String() {
 						return true // same struct type+field, unknown base
 					}
 				}
@@ -707,7 +707,7 @@ func recvOfCall(c *ssa.CallCommon) ssa.Value {
 	return nil
 }
 
-func killEscaping(held map[guardKey]bool, v ssa.Value) {
+func killEscaping(held holdSet, v ssa.Value) {
 	obj := stripToObject(v)
 	for g := range held {
 		if g.base == obj || baseCoversAddr(g.base, v) || stripToObject(v) == g.base {
@@ -717,13 +717,17 @@ func killEscaping(held map[guardKey]bool, v ssa.Value) {
 		if fa, ok := v.(*ssa.FieldAddr); ok && fa.Field == g.field && stripToObject(fa.X) == g.base {
 			delete(held, g)
 		}
+		// Free-standing global mutex passed by address.
+		if g.field < 0 && obj == g.base {
+			delete(held, g)
+		}
 	}
 }
 
 func lockUnlockGuard(c *ssa.CallCommon) (guardKey, bool) {
 	name := mutexMethodName(c)
 	switch name {
-	case "Lock", "Unlock", "TryLock":
+	case "Lock", "Unlock", "TryLock", "RLock", "RUnlock", "TryRLock":
 	default:
 		return guardKey{}, false
 	}
@@ -731,16 +735,36 @@ func lockUnlockGuard(c *ssa.CallCommon) (guardKey, bool) {
 	if recv == nil {
 		return guardKey{}, false
 	}
-	fa, ok := recv.(*ssa.FieldAddr)
+	if fa, ok := recv.(*ssa.FieldAddr); ok {
+		isMu := isNamedSyncType(fa.Type(), "Mutex")
+		isRW := isNamedSyncType(fa.Type(), "RWMutex")
+		if !isMu && !isRW {
+			return guardKey{}, false
+		}
+		if isMu && (name == "RLock" || name == "RUnlock" || name == "TryRLock") {
+			return guardKey{}, false
+		}
+		return guardKey{base: stripToObject(fa.X), field: fa.Field}, true
+	}
+	// Free-standing package-level Mutex / *Mutex / RWMutex / *RWMutex.
+	base := recv
+	if u, ok := recv.(*ssa.UnOp); ok && u.Op == token.MUL {
+		base = u.X
+	}
+	base = stripToObject(base)
+	gl, ok := base.(*ssa.Global)
 	if !ok {
-		// Could be a *sync.Mutex local, not a struct field — not a structural guard.
 		return guardKey{}, false
 	}
-	if !isNamedSyncType(fa.Type(), "Mutex") {
+	isMu := isNamedSyncType(gl.Type(), "Mutex")
+	isRW := isNamedSyncType(gl.Type(), "RWMutex")
+	if !isMu && !isRW {
 		return guardKey{}, false
 	}
-	base := stripToObject(fa.X)
-	return guardKey{base: base, field: fa.Field}, true
+	if isMu && (name == "RLock" || name == "RUnlock" || name == "TryRLock") {
+		return guardKey{}, false
+	}
+	return guardKey{base: gl, field: -1}, true
 }
 
 func mutexRecv(c *ssa.CallCommon) ssa.Value {
@@ -773,12 +797,18 @@ func isMutexLockUnlockCall(c *ssa.CallCommon) bool {
 	return false
 }
 
+// isMutexGuardCall reports Lock/Unlock/RLock/RUnlock/Try* on Mutex or RWMutex.
+func isMutexGuardCall(c *ssa.CallCommon) bool {
+	_, ok := lockUnlockGuard(c)
+	return ok
+}
+
 func isMutexFieldAddr(v ssa.Value) bool {
 	fa, ok := v.(*ssa.FieldAddr)
 	if !ok {
 		return false
 	}
-	return isNamedSyncType(fa.Type(), "Mutex")
+	return isNamedSyncType(fa.Type(), "Mutex", "RWMutex")
 }
 
 // stripToObject walks address computations down to Alloc/Param/FreeVar/Global.
@@ -884,35 +914,41 @@ func hasStructuralRWMutex(root ssa.Value) bool {
 	return false
 }
 
-func cloneGuardSet(s map[guardKey]bool) map[guardKey]bool {
+func cloneGuardSet(s holdSet) holdSet {
 	if s == nil {
-		return map[guardKey]bool{}
+		return holdSet{}
 	}
-	out := make(map[guardKey]bool, len(s))
+	out := make(holdSet, len(s))
 	for k, v := range s {
-		if v {
-			out[k] = true
+		if v != 0 {
+			out[k] = v
 		}
 	}
 	return out
 }
 
-func intersectGuards(a, b map[guardKey]bool) map[guardKey]bool {
-	out := map[guardKey]bool{}
-	for k := range a {
-		if b[k] {
-			out[k] = true
+func intersectGuards(a, b holdSet) holdSet {
+	out := holdSet{}
+	for k, am := range a {
+		if bm, ok := b[k]; ok {
+			m := am
+			if bm < m {
+				m = bm
+			}
+			if m != 0 {
+				out[k] = m
+			}
 		}
 	}
 	return out
 }
 
-func guardSetEqual(a, b map[guardKey]bool) bool {
+func guardSetEqual(a, b holdSet) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for k := range a {
-		if !b[k] {
+	for k, am := range a {
+		if b[k] != am {
 			return false
 		}
 	}

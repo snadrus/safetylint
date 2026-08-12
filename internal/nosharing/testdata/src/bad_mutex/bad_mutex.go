@@ -5,7 +5,7 @@ import "sync"
 func SharedMap() {
 	var mu sync.Mutex
 	m := map[string]int{}
-	go func() { // want `shared memory .* written without channel transfer and no always-locked sync.Mutex guard`
+	go func() { // want `shared memory .* written without channel transfer and no proven lock/atomic/partition guard`
 		mu.Lock()
 		m["a"] = 1
 		mu.Unlock()

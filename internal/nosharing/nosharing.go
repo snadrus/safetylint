@@ -1,21 +1,19 @@
 // Package nosharing refuses cross-goroutine memory sharing except via
 // channels with freeze-after-send semantics for pointer-carrying values,
-// or via one consistent tied sync.Mutex field in the same/parent struct.
+// or via a proven lock/atomic/partition guard (north-star cascade).
 //
 // Provably read-only sharing is allowed. sync.WaitGroup, sync.Once, and
 // sync.Mutex (as a lock object) are whitelisted as pure synchronization.
-// RWMutex-guarded data sharing is refused (sync.Mutex is just as fast). TryLock only counts on paths
-// where its boolean result is proven true.
+// TryLock/TryRLock only count on paths where their boolean result is proven true.
 //
 // Cross-package: functions that spawn and retain parameters export
 // MayShareParams Facts; callers must not write those values after the call
-// unless under the Fact's tied mutex.
+// unless under a proven guard.
 //
 // Package globals follow an init-then-freeze discipline: in packages that
 // spawn goroutines, globals may only be written before any goroutine could
 // be running (init functions, main before the first spawn, and helpers
-// provably called only from such points), or under a proven struct-embedded
-// sync.Mutex guard.
+// provably called only from such points), or under a proven guard.
 package nosharing
 
 import (
@@ -36,27 +34,27 @@ import (
 const Doc = `refuse memory shared between goroutines except via frozen channels
 
 The nosharing analyzer proves the absence of data races under a channel-only
-sharing discipline, with a narrow exception for proven sync.Mutex guards:
+sharing discipline, with proven lock / atomic / partition exceptions:
 
   - Memory shared with a goroutine via capture, argument, or global must be
     provably read-only, be *sync.WaitGroup / *sync.Once / *sync.Mutex, be
-    context.Context / *net/http.Server (stdlib concurrent protocols), or be
-    guarded by one tied sync.Mutex field in the same (or parent) struct that
-    is always locked at every access. TryLock only counts on paths where its
-    boolean result is proven true.
+    context.Context / *net/http.Server (stdlib concurrent protocols), or pass
+    the guard cascade: tied sync.Mutex field; free-standing package
+    Mutex/RWMutex held at every touch; RWMutex Lock writes / Lock|RLock reads;
+    concurrent touches only via sync/atomic; or const-index partitioned
+    slice/array writers. TryLock/TryRLock only count on proven-true paths.
   - Values may transfer between goroutines through channels. If a sent value
     contains pointers, those pointees are frozen after send: no further writes
     through the sender's or receiver's view of that memory are allowed.
-  - sync.RWMutex-guarded sharing is refused — sync.Mutex is just as fast.
   - In packages that spawn goroutines, package globals are frozen once
     concurrency may have begun: writes are allowed only in init functions,
     in main before the first spawn point (go, dynamic/interface call,
     Fact-bearing or curated stdlib spawner), in unexported helpers
-    provably called only from such points, or under a proven struct-embedded
-    sync.Mutex guard. Reads of frozen globals remain legal.
+    provably called only from such points, or under a proven guard.
+    Reads of frozen globals remain legal.
   - Exported functions that spawn and retain parameters publish MayShareParams
     Facts. Call sites must treat those arguments as shared: no post-call
-    writes unless under the Fact's tied sync.Mutex. Wrappers re-export Facts.
+    writes unless under a proven guard. Wrappers re-export Facts.
   - Curated async stdlib APIs (time.AfterFunc, http.HandleFunc, …) share
     closure captures like Fact-bearing calls. Toolchains newer than this
     tool's verified Go version warn that new standard funcs may be unverified.
@@ -247,19 +245,9 @@ func (a *analyzer) checkGo(g *ssa.Go, spawner *ssa.Function, globals map[*ssa.Gl
 		if isChanType(root.val.Type()) {
 			continue
 		}
-		if isWhitelistedSync(root.val) || isSyncMutex(root.val) || isShareSafeStdlib(root.val) {
-			// WaitGroup/Once/Mutex objects are pure synchronization.
+		if isWhitelistedSync(root.val) || isSyncMutex(root.val) || isSyncRWMutex(root.val) || isShareSafeStdlib(root.val) {
+			// WaitGroup/Once/Mutex/RWMutex objects are pure synchronization.
 			// context.Context and *http.Server are stdlib-safe to share.
-			continue
-		}
-		if isSyncRWMutex(root.val) {
-			key := "rwmutex:" + typeKey(root.val)
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			a.reportAt(reported, g.Pos(), "shared sync.RWMutex %s: RWMutex-guarded sharing refused — sync.Mutex is just as fast (or use channels)",
-				root.describe())
 			continue
 		}
 		if _, isGlobal := root.val.(*ssa.Global); isGlobal {
@@ -276,8 +264,7 @@ func (a *analyzer) checkGo(g *ssa.Go, spawner *ssa.Function, globals map[*ssa.Gl
 		writtenAfter := isWrittenAfterGo(root.val, spawner, g, a.funcs, reachable)
 
 		if writtenInGoro || writtenAfter {
-			// Prove over all sibling aliases for this go: every touchpoint of
-			// the shared object must use the same tied mutex.
+			// Prove over all sibling aliases for this go via the guard cascade.
 			if mutexGuardsGoRoots(roots, allFuncs) {
 				for _, r := range roots {
 					seen["write:"+typeKey(r.val)] = true
@@ -289,13 +276,8 @@ func (a *analyzer) checkGo(g *ssa.Go, spawner *ssa.Function, globals map[*ssa.Gl
 				continue
 			}
 			seen[key] = true
-			if hasStructuralRWMutex(root.val) {
-				a.reportAt(reported, g.Pos(), "shared RWMutex-guarded memory %s: RWMutex-guarded sharing refused — sync.Mutex is just as fast (or use channels) (%s)",
-					root.describe(), root.reason)
-			} else {
-				a.reportAt(reported, g.Pos(), "shared memory %s written without channel transfer and no always-locked sync.Mutex guard (%s)",
-					root.describe(), root.reason)
-			}
+			a.reportAt(reported, g.Pos(), "shared memory %s written without channel transfer and no proven lock/atomic/partition guard (%s)",
+				root.describe(), root.reason)
 		}
 	}
 }

@@ -9,11 +9,12 @@ strict sharing discipline. Add it to your CI.
 Go without `unsafe` / cgo is memory-safe when single-threaded, but not when
 goroutines share mutable memory. safetylint refuses the escape hatches and
 then refuses cross-goroutine sharing except via channels with
-**freeze-after-send** for pointer-carrying values, or via a **proven
-always-held `sync.Mutex`** embedded in the same (or parent) struct as the data.
+**freeze-after-send** for pointer-carrying values, or via a **proven guard**:
+tied/`free-standing` mutexes, RWMutex Lock/RLock discipline, atomics-only
+touches, or const-index partitioned buffer writers.
 
-Note: *Exotic* mutex usage simply fails. Just like Escape analysis, 
-if you feel like getting complicated, I just haven't implemented your case yet. PRs are welcomed. Keep mutexes near their data. Keep things in-package. 
+Note: *Exotic* locking simply fails. Just like Escape analysis,
+if you feel like getting complicated, I just haven't implemented your case yet. PRs are welcomed. Keep things in-package when you can. 
 
 ## Install / run
 
@@ -43,22 +44,27 @@ doubt, it **rejects**):
 2. **No racy shared memory** (`nosharing`)
    - Memory shared with a goroutine via capture, argument, or global must be
      **provably read-only**, be `*sync.WaitGroup` / `*sync.Once` / `*sync.Mutex`,
-     or be guarded by **one tied** `sync.Mutex` field in the **same or parent
-     struct** that is **always locked** at every access (reads and writes).
+     or pass the **guard cascade**:
+     1. **one tied** `sync.Mutex` field in the **same or parent struct**,
+        always locked at every access;
+     2. **one free-standing package** `sync.Mutex` / `*sync.Mutex` held at
+        every access of that object;
+     3. **`sync.RWMutex` discipline** (tied or free-standing): every write
+        under `Lock`, every read under `Lock` or `RLock`;
+     4. **atomics-only** concurrent touches (`sync/atomic`);
+     5. **const-index partitioned** slice/array writers (disjoint indexes,
+        no concurrent reads / header mutation).
      Different mutex fields of the same struct are not interchangeable.
      Writes through separately heap-allocated objects reached only via
      pointer fields of the shared value do not count as writing that value
      (e.g. `cfg.DB.Query` does not write `*Cfg`); module-cache callees export
      `WritesParams` Facts so third-party pointer calls can be evaluated.
-   - `mu.TryLock()` only counts as an acquire on CFG paths where its boolean
-     result is proven true (e.g. `if mu.TryLock() { ... }` or
-     `ok := mu.TryLock(); if !ok { return }; ...`).
+   - `mu.TryLock()` / `TryRLock()` only count as an acquire on CFG paths where
+     the boolean result is proven true.
    - Values may move between goroutines through **channels**.
    - If a sent value contains pointers, those pointees are **frozen after
      send**: neither sender nor receiver may write through them afterward.
    - Pointer-free values copied by a channel may be mutated freely after send.
-   - `sync.RWMutex`-guarded sharing is **refused** (`sync.Mutex` is just as
-     fast; or use channels).
 
 3. **Globals are init-then-freeze** (`nosharing`)
 
@@ -74,8 +80,9 @@ doubt, it **rejects**):
    Fact-bearing spawner (`MaySpawn` / `MayShareParams`), or a curated stdlib
    server API (`http.ListenAndServe`, `Serve`, …) — not every Fact-less
    cross-package call. After the first spawn point, globals are frozen:
-   **reads stay legal**, and writes are refused unless the global is a struct
-   with an embedded `sync.Mutex` whose accesses are all proven locked.
+   **reads stay legal**, and writes are refused unless the guard cascade
+   proves a lock/atomic/partition (including a free-standing package mutex
+   held at every touch).
 
 4. **Cross-package share Facts** (`nosharing`)
 
@@ -113,9 +120,9 @@ func (c *Counter) Inc() {
 }
 ```
 
-A free-standing `sync.Mutex` beside unrelated data (not a field of the same
-struct) does **not** count as a guard. If a struct has multiple mutex fields,
-every access of a shared field must use the **same** tied mutex.
+A free-standing package-level `sync.Mutex` counts when that **same** mutex is
+held at every access of the shared object. If a struct has multiple mutex
+fields, every access of a shared field must use the **same** tied mutex.
 
 ## Examples
 
@@ -139,13 +146,10 @@ safetylint prefers false rejections over missed races:
 
 - Mutex proofs are **intra-procedural**: the lock and the access must be in
   the same function (caller-held locks are not inferred). Across functions,
-  one **tied** mutex field (same struct type + field) must protect every
-  touchpoint of the shared memory.
-- `TryLock` is not treated as an unconditional acquire; only paths where the
+  one **tied** mutex field (same struct type + field), or one free-standing
+  package mutex, must protect every touchpoint of the shared memory.
+- `TryLock` / `TryRLock` are not unconditional acquires; only paths where the
   result is proven true acquire the guard.
-- Only **struct-embedded** `sync.Mutex` fields guard data; free-standing
-  mutexes do not.
-- `sync.RWMutex` is never accepted as a guard (`sync.Mutex` is just as fast).
 - Ownership hand-off where the **receiver** mutates channel-sent pointers is
   rejected (freeze-after-send, not transfer-of-mutability).
 - Dynamic `go` callees (interfaces / function values) are rejected.

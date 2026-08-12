@@ -389,7 +389,10 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 			return false
 		}
 		if isAtomicCallee(callee) {
-			return false
+			// Atomic ops mutate the atomic cell. Count as writes so share/freeze
+			// sites must prove atomics-only (or a lock) rather than treating
+			// them as read-only no-ops. Freeze still skips them in globalWrites.
+			return true
 		}
 		if isStdlibReadOnlyCall(callee) {
 			return false
