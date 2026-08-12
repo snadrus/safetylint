@@ -68,6 +68,13 @@ doubt, it **rejects**):
      pointer fields of the shared value do not count as writing that value
      (e.g. `cfg.DB.Query` does not write `*Cfg`); module-cache callees export
      `WritesParams` Facts so third-party pointer calls can be evaluated.
+   - **InitOnly** registration helpers (map/slice package globals, no spawn,
+     init-only callers) may write those globals; importers must call them
+     only from `init` / var initializers (`var _ = Reg(…)`).
+   - `[]byte`/`string` payloads and interface method receivers are not assumed
+     written by bodyless/interface calls (Broadcast-style fan-out).
+   - Dynamic `go fn(…)` is allowed when every same-package assignment to `fn`
+     is a known local function/closure; otherwise it is refused.
    - `mu.TryLock()` / `TryRLock()` only count as an acquire on CFG paths where
      the boolean result is proven true.
    - Values may move between goroutines through **channels**.

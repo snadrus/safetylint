@@ -106,6 +106,11 @@ func (a *analyzer) checkGlobalFreeze(reported map[string]bool) {
 					}
 				}
 				for _, gl := range gls {
+					// InitOnly helpers may write globals; callers are restricted
+					// to init/var initializers via checkInitOnlyCalls.
+					if a.isInitOnlyFunc(fn) {
+						continue
+					}
 					if mutexOK[gl] == 0 {
 						if mutexGuardsAccesses(gl, allFuncs) {
 							mutexOK[gl] = 1

@@ -51,7 +51,8 @@ sharing discipline, with proven lock / atomic / partition exceptions:
     concurrency may have begun: writes are allowed only in init functions,
     in main before the first spawn point (go, dynamic/interface call,
     Fact-bearing or curated stdlib spawner), in unexported helpers
-    provably called only from such points, or under a proven guard.
+    provably called only from such points, under a proven guard, or inside
+    InitOnly registration helpers (callers must be init/var initializers).
     Reads of frozen globals remain legal.
   - Exported functions that spawn and retain parameters publish MayShareParams
     Facts. Call sites must treat those arguments as shared: no post-call
@@ -74,6 +75,7 @@ var Analyzer = &analysis.Analyzer{
 	FactTypes: []analysis.Fact{
 		new(MayShareParams),
 		new(MaySpawn),
+		new(InitOnly),
 		new(HotGlobals),
 		new(WritesParams),
 	},
@@ -108,11 +110,12 @@ func run(pass *analysis.Pass) (any, error) {
 	}
 	ssainfo := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 	a := &analyzer{
-		pass:       pass,
-		pkg:        ssainfo.Pkg,
-		funcs:      ssainfo.SrcFuncs,
-		localShare: map[*types.Func]*MayShareParams{},
-		localSpawn: map[*types.Func]bool{},
+		pass:          pass,
+		pkg:           ssainfo.Pkg,
+		funcs:         ssainfo.SrcFuncs,
+		localShare:    map[*types.Func]*MayShareParams{},
+		localSpawn:    map[*types.Func]bool{},
+		localInitOnly: map[*types.Func]bool{},
 	}
 	if packageInModuleCache(pass) {
 		a.exportParamWriteFacts()
@@ -159,6 +162,7 @@ type analyzer struct {
 	funcs          []*ssa.Function
 	localShare     map[*types.Func]*MayShareParams
 	localSpawn     map[*types.Func]bool
+	localInitOnly  map[*types.Func]bool
 	localHot       *HotGlobals
 	initConcurrent bool
 }
@@ -199,10 +203,12 @@ func (a *analyzer) run() {
 
 	if factsEnabled() {
 		a.exportShareFacts()
+		a.exportInitOnlyFacts()
 		a.exportHotGlobals()
 	}
 	a.checkShareFactCalls(reported)
 	a.checkAsyncCallbackShares(reported)
+	a.checkInitOnlyCalls(reported)
 	a.checkGlobalFreeze(reported)
 	a.checkHotGlobalAccesses(reported)
 }
@@ -222,13 +228,17 @@ func (a *analyzer) reportAt(reported map[string]bool, pos token.Pos, format stri
 }
 
 func (a *analyzer) checkGo(g *ssa.Go, spawner *ssa.Function, globals map[*ssa.Global]bool, reported map[string]bool) {
-	common := g.Common()
-	callee := staticCallee(common)
-	if callee == nil {
+	callees := a.goCallees(g)
+	if len(callees) == 0 {
 		a.reportAt(reported, g.Pos(), "goroutine with non-static callee: cannot prove memory safety")
 		return
 	}
+	for _, callee := range callees {
+		a.checkGoCallee(g, spawner, callee, globals, reported)
+	}
+}
 
+func (a *analyzer) checkGoCallee(g *ssa.Go, spawner, callee *ssa.Function, globals map[*ssa.Global]bool, reported map[string]bool) {
 	roots := collectRoots(g, callee, globals)
 	allFuncs := map[*ssa.Function]bool{}
 	for _, f := range a.funcs {
@@ -263,6 +273,12 @@ func (a *analyzer) checkGo(g *ssa.Go, spawner *ssa.Function, globals map[*ssa.Gl
 
 		writtenInGoro := a.writtenIn(root.val, reachable, true)
 		writtenAfter := isWrittenAfterGo(root.val, spawner, g, a.funcs, reachable)
+		// Struct/array value snapshots captured into a goroutine and only
+		// read there: ignore spawner reassignment of the capture cell
+		// (loop-local map lookups under a lock, Go 1.22+ per-iteration vars).
+		if writtenAfter && !writtenInGoro && valueSnapshotReadOnly(root.val, spawner, g) {
+			writtenAfter = false
+		}
 
 		if writtenInGoro || writtenAfter {
 			// Prove over same-object peers only (same strip/type). Package

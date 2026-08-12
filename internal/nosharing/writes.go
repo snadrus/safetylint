@@ -90,6 +90,90 @@ func globalWrittenIn(pass *analysis.Pass, gl *ssa.Global, funcs map[*ssa.Functio
 // outside the goroutine: any write in a non-goroutine function other than
 // the spawner, or a write in the spawner that is not proven to happen
 // before the go statement.
+// valueSnapshotReadOnly reports that root is a non-pointer struct/array
+// value whose only spawner-side writes after go are whole-cell reassignments
+// (not field stores). Used for Broadcast-style map-lookup captures.
+func valueSnapshotReadOnly(root ssa.Value, spawner *ssa.Function, g *ssa.Go) bool {
+	if root == nil || spawner == nil || g == nil {
+		return false
+	}
+	switch root.(type) {
+	case *ssa.FreeVar, *ssa.Alloc:
+	default:
+		return false
+	}
+	t := types.Unalias(root.Type())
+	// Closure FreeVars for address-taken locals are often *T pointing at a
+	// heap cell that holds the struct value T.
+	if p, ok := t.(*types.Pointer); ok {
+		t = types.Unalias(p.Elem())
+	}
+	ut := t.Underlying()
+	switch ut.(type) {
+	case *types.Struct, *types.Array:
+	default:
+		return false
+	}
+	return onlyWholeValueReassignAfterGo(root, spawner, g)
+}
+
+func onlyWholeValueReassignAfterGo(root ssa.Value, fn *ssa.Function, g *ssa.Go) bool {
+	goBlock := g.Block()
+	goIdx := instrIndex(goBlock, g)
+	derived := deriveOwnAddrs(root, map[*ssa.Function]bool{fn: true})
+	saw := false
+	for v := range derived {
+		refs := v.Referrers()
+		if refs == nil {
+			continue
+		}
+		for _, ref := range *refs {
+			if ref.Parent() != fn {
+				continue
+			}
+			st, ok := ref.(*ssa.Store)
+			if !ok || st.Addr != v {
+				// Any non-store write-like use after go fails the snapshot shape.
+				if isWriteInstr(ref, v) {
+					rb := ref.Block()
+					ri := instrIndex(rb, ref)
+					if rb == goBlock && ri < goIdx {
+						continue
+					}
+					if rb != goBlock && rb.Dominates(goBlock) && !blockInCycle(rb) {
+						continue
+					}
+					return false
+				}
+				continue
+			}
+			// Field/index stores mutate the snapshot in place — not a reassignment.
+			switch st.Addr.(type) {
+			case *ssa.FieldAddr, *ssa.IndexAddr:
+				rb := st.Block()
+				ri := instrIndex(rb, st)
+				if rb == goBlock && ri < goIdx {
+					continue
+				}
+				if rb != goBlock && rb.Dominates(goBlock) && !blockInCycle(rb) {
+					continue
+				}
+				return false
+			}
+			rb := st.Block()
+			ri := instrIndex(rb, st)
+			if rb == goBlock && ri < goIdx {
+				continue
+			}
+			if rb != goBlock && rb.Dominates(goBlock) && !blockInCycle(rb) {
+				continue
+			}
+			saw = true
+		}
+	}
+	return saw
+}
+
 func isWrittenAfterGo(root ssa.Value, spawner *ssa.Function, g *ssa.Go, all []*ssa.Function, goro map[*ssa.Function]bool) bool {
 	for _, f := range all {
 		if f == nil || goro[f] {
@@ -383,6 +467,18 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 		return false
 	}
 
+	// Interface method call: the iface value itself is not mutated; []byte /
+	// string payloads are treated as read-only unless a concrete body says
+	// otherwise (Broadcast-style fan-out of immutable messages).
+	if c.IsInvoke() {
+		if c.Value == v {
+			return false
+		}
+		if argOrRecvIs(c, v) && isReadOnlyPayloadType(v.Type()) {
+			return false
+		}
+	}
+
 	callee := c.StaticCallee()
 	if callee != nil {
 		if isShareSafeStdlib(v) {
@@ -415,6 +511,10 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 		if known, writes := writesParamsFact(pass, c, v); known {
 			return writes
 		}
+		// Bodyless with []byte/string arg: default read-only payload.
+		if argOrRecvIs(c, v) && isReadOnlyPayloadType(v.Type()) {
+			return false
+		}
 		// Still unknown: pessimistic.
 		if pessimistic && argOrRecvIs(c, v) {
 			return true
@@ -425,8 +525,31 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 	if isShareSafeStdlib(v) {
 		return false
 	}
+	if argOrRecvIs(c, v) && isReadOnlyPayloadType(v.Type()) {
+		return false
+	}
 	if pessimistic && argOrRecvIs(c, v) {
 		return true
+	}
+	return false
+}
+
+// isReadOnlyPayloadType reports []byte / string (and aliases) that are
+// shared as immutable message payloads. *[]byte is not included — the
+// header cell itself may be reassigned.
+func isReadOnlyPayloadType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	t = types.Unalias(t)
+	if b, ok := t.Underlying().(*types.Basic); ok {
+		return b.Kind() == types.String || b.Kind() == types.UntypedString
+	}
+	if s, ok := t.Underlying().(*types.Slice); ok {
+		elem := types.Unalias(s.Elem()).Underlying()
+		if b, ok := elem.(*types.Basic); ok {
+			return b.Kind() == types.Byte || b.Kind() == types.Uint8
+		}
 	}
 	return false
 }
