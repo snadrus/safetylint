@@ -429,7 +429,14 @@ func analyzeMustHold(fn *ssa.Function) map[ssa.Instruction]holdSet {
 		blockOut[fn.Blocks[i].Index] = cloneGuardSet(top)
 	}
 	entry := fn.Blocks[0]
-	blockIn[entry.Index] = holdSet{}
+	// Unlock/RUnlock wrappers run while the caller still holds the lock;
+	// model that hold on entry so bookkeeping under the critical section
+	// (before the inner Unlock) is recognized.
+	if init := wrapperEntryHold(fn); init != nil {
+		blockIn[entry.Index] = init
+	} else {
+		blockIn[entry.Index] = holdSet{}
+	}
 
 	changed := true
 	for changed {
@@ -437,7 +444,11 @@ func analyzeMustHold(fn *ssa.Function) map[ssa.Instruction]holdSet {
 		for _, b := range fn.Blocks {
 			var in holdSet
 			if len(b.Preds) == 0 {
-				in = holdSet{}
+				if b == entry {
+					in = cloneGuardSet(blockIn[entry.Index])
+				} else {
+					in = holdSet{}
+				}
 			} else {
 				in = edgeHold(b.Preds[0], b, blockOut, tryResults)
 				for _, p := range b.Preds[1:] {
@@ -783,19 +794,227 @@ func lockUnlockGuard(c *ssa.CallCommon) (guardKey, bool) {
 		base = u.X
 	}
 	base = stripToObject(base)
-	gl, ok := base.(*ssa.Global)
+	if gl, ok := base.(*ssa.Global); ok {
+		isMu := isNamedSyncType(gl.Type(), "Mutex")
+		isRW := isNamedSyncType(gl.Type(), "RWMutex")
+		if isMu || isRW {
+			if isMu && (name == "RLock" || name == "RUnlock" || name == "TryRLock") {
+				return guardKey{}, false
+			}
+			return guardKey{base: gl, field: -1}, true
+		}
+	}
+	// Custom Lock/Unlock/RLock/RUnlock methods that wrap a tied field.
+	return wrapperLockGuard(c, name, base)
+}
+
+// wrapperEntryHold returns the must-held set at entry to an Unlock/RUnlock
+// wrapper method (caller still holds the tied field).
+func wrapperEntryHold(fn *ssa.Function) holdSet {
+	if fn == nil || fn.Signature.Recv() == nil || len(fn.Params) == 0 {
+		return nil
+	}
+	name := fn.Name()
+	switch name {
+	case "Unlock", "RUnlock":
+	default:
+		return nil
+	}
+	field, _, ok := mutexWrapperField(fn, name)
+	if !ok {
+		return nil
+	}
+	mode := holdWrite
+	if name == "RUnlock" {
+		mode = holdRead
+	}
+	return holdSet{guardKey{base: fn.Params[0], field: field}: mode}
+}
+
+// wrapperLockGuard recognizes user methods named Lock/Unlock/RLock/RUnlock
+// whose body always acquires or releases one tied sync.Mutex/RWMutex field
+// of the receiver (e.g. embedding sync.Mutex and redefining Lock to add
+// bookkeeping). TryLock/TryRLock wrappers are not modeled.
+func wrapperLockGuard(c *ssa.CallCommon, name string, base ssa.Value) (guardKey, bool) {
+	switch name {
+	case "Lock", "Unlock", "RLock", "RUnlock":
+	default:
+		return guardKey{}, false
+	}
+	if c.IsInvoke() || base == nil {
+		return guardKey{}, false
+	}
+	cal := c.StaticCallee()
+	if cal == nil || isSyncMutexMethod(cal) || isRWMutexMethod(cal) {
+		return guardKey{}, false
+	}
+	field, isRW, ok := mutexWrapperField(cal, name)
 	if !ok {
 		return guardKey{}, false
 	}
-	isMu := isNamedSyncType(gl.Type(), "Mutex")
-	isRW := isNamedSyncType(gl.Type(), "RWMutex")
-	if !isMu && !isRW {
+	if !isRW && (name == "RLock" || name == "RUnlock") {
 		return guardKey{}, false
 	}
-	if isMu && (name == "RLock" || name == "RUnlock" || name == "TryRLock") {
-		return guardKey{}, false
+	return guardKey{base: base, field: field}, true
+}
+
+type wrapperField struct {
+	field int
+	isRW  bool
+}
+
+// mutexWrapperField reports the tied Mutex/RWMutex field that cal always
+// locks or unlocks on its receiver via a direct sync method. Fail closed
+// on Try*, nested non-sync wrappers, or disagreeing fields/paths.
+func mutexWrapperField(cal *ssa.Function, name string) (field int, isRW bool, ok bool) {
+	if cal == nil || len(cal.Blocks) == 0 || cal.Signature.Recv() == nil || len(cal.Params) == 0 {
+		return 0, false, false
 	}
-	return guardKey{base: gl, field: -1}, true
+	switch name {
+	case "Lock", "Unlock", "RLock", "RUnlock":
+	default:
+		return 0, false, false
+	}
+	recv := cal.Params[0]
+	opsByBlock := make([]map[wrapperField]bool, len(cal.Blocks))
+	releaseByBlock := make([]map[wrapperField]bool, len(cal.Blocks))
+	candidates := map[wrapperField]bool{}
+
+	for _, b := range cal.Blocks {
+		opsByBlock[b.Index] = map[wrapperField]bool{}
+		releaseByBlock[b.Index] = map[wrapperField]bool{}
+		for _, instr := range b.Instrs {
+			fk, opName, found := recvMutexFieldOp(instr, recv)
+			if !found {
+				continue
+			}
+			if opName == "TryLock" || opName == "TryRLock" {
+				return 0, false, false
+			}
+			if opName == name {
+				opsByBlock[b.Index][fk] = true
+				candidates[fk] = true
+			}
+			if opName == "Unlock" || opName == "RUnlock" {
+				releaseByBlock[b.Index][fk] = true
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return 0, false, false
+	}
+	for fk := range candidates {
+		if (name == "Lock" || name == "RLock") && wrapperBlockHas(releaseByBlock, fk) {
+			continue // acquire wrapper must not release
+		}
+		if wrapperMustPerform(cal, recv, name, fk, opsByBlock) {
+			return fk.field, fk.isRW, true
+		}
+	}
+	return 0, false, false
+}
+
+func wrapperBlockHas(byBlock []map[wrapperField]bool, fk wrapperField) bool {
+	for _, m := range byBlock {
+		if m[fk] {
+			return true
+		}
+	}
+	return false
+}
+
+// wrapperMustPerform reports whether every path to a Return performs name on
+// fk (direct sync op on the receiver field). Defer counts as performing the
+// op before the function returns to its caller.
+func wrapperMustPerform(cal *ssa.Function, recv ssa.Value, name string, fk wrapperField, opsByBlock []map[wrapperField]bool) bool {
+	n := len(cal.Blocks)
+	if n == 0 {
+		return false
+	}
+	seenIn := make([]bool, n)
+	seenOut := make([]bool, n)
+	for i := range seenOut {
+		seenOut[i] = true // TOP for must-analysis
+	}
+	entry := cal.Blocks[0]
+	seenOut[entry.Index] = false
+
+	changed := true
+	for changed {
+		changed = false
+		for _, b := range cal.Blocks {
+			var in bool
+			if len(b.Preds) == 0 {
+				in = false
+			} else {
+				in = true
+				for _, p := range b.Preds {
+					if !seenOut[p.Index] {
+						in = false
+						break
+					}
+				}
+			}
+			out := in || opsByBlock[b.Index][fk]
+			if in != seenIn[b.Index] || out != seenOut[b.Index] {
+				seenIn[b.Index] = in
+				seenOut[b.Index] = out
+				changed = true
+			}
+		}
+	}
+
+	hasRet := false
+	for _, b := range cal.Blocks {
+		seen := seenIn[b.Index]
+		for _, instr := range b.Instrs {
+			if _, isRet := instr.(*ssa.Return); isRet {
+				hasRet = true
+				if !seen {
+					return false
+				}
+			}
+			if fk2, opName, found := recvMutexFieldOp(instr, recv); found && opName == name && fk2 == fk {
+				seen = true
+			}
+		}
+	}
+	return hasRet
+}
+
+// recvMutexFieldOp reports a direct sync.Mutex/RWMutex Lock/Unlock/… on a
+// FieldAddr of recv. Nested user wrappers are ignored (fail closed).
+func recvMutexFieldOp(instr ssa.Instruction, recv ssa.Value) (wrapperField, string, bool) {
+	var common *ssa.CallCommon
+	switch in := instr.(type) {
+	case *ssa.Call:
+		common = in.Common()
+	case *ssa.Defer:
+		common = in.Common()
+	default:
+		return wrapperField{}, "", false
+	}
+	opName := mutexMethodName(common)
+	switch opName {
+	case "Lock", "Unlock", "RLock", "RUnlock", "TryLock", "TryRLock":
+	default:
+		return wrapperField{}, "", false
+	}
+	sc := common.StaticCallee()
+	if sc == nil || (!isSyncMutexMethod(sc) && !isRWMutexMethod(sc)) {
+		return wrapperField{}, "", false
+	}
+	mrecv := mutexRecv(common)
+	fa, isFA := mrecv.(*ssa.FieldAddr)
+	if !isFA || stripToObject(fa.X) != recv {
+		return wrapperField{}, "", false
+	}
+	isMu := isNamedSyncType(fa.Type(), "Mutex")
+	isRWField := isNamedSyncType(fa.Type(), "RWMutex")
+	if !isMu && !isRWField {
+		return wrapperField{}, "", false
+	}
+	return wrapperField{field: fa.Field, isRW: isRWField}, opName, true
 }
 
 func mutexRecv(c *ssa.CallCommon) ssa.Value {

@@ -39,7 +39,8 @@ sharing discipline, with proven lock / atomic / partition exceptions:
   - Memory shared with a goroutine via capture, argument, or global must be
     provably read-only, be *sync.WaitGroup / *sync.Once / *sync.Mutex, be
     context.Context / *net/http.Server (stdlib concurrent protocols), or pass
-    the guard cascade: tied sync.Mutex field; free-standing package
+    the guard cascade: tied sync.Mutex field (including Lock/Unlock/RLock/
+    RUnlock methods that always wrap that field); free-standing package
     Mutex/RWMutex held at every touch; RWMutex Lock writes / Lock|RLock reads;
     concurrent touches only via sync/atomic; or const-index partitioned
     slice/array writers. TryLock/TryRLock only count on proven-true paths.
@@ -250,7 +251,7 @@ func (a *analyzer) checkGo(g *ssa.Go, spawner *ssa.Function, globals map[*ssa.Gl
 			// context.Context and *http.Server are stdlib-safe to share.
 			continue
 		}
-		if _, isGlobal := root.val.(*ssa.Global); isGlobal {
+		if isGlobalObject(root.val) {
 			// Globals are covered package-wide by the init-then-freeze
 			// analysis (checkGlobalFreeze), which also reports writes in
 			// functions not reachable from any go statement.

@@ -24,7 +24,9 @@ func collectRoots(g *ssa.Go, callee *ssa.Function, globals map[*ssa.Global]bool)
 
 	// Closure free variables (captures). Prefer the FreeVar inside the
 	// callee for write detection; also keep the binding so spawner-side
-	// writes after go are visible.
+	// writes after go are visible. Package globals are freeze-owned: do
+	// not also treat a FreeVar cell that merely names a global as a
+	// separate shared heap root.
 	if common := g.Common(); common != nil {
 		if mc, ok := common.Value.(*ssa.MakeClosure); ok {
 			for i, bind := range mc.Bindings {
@@ -33,7 +35,7 @@ func collectRoots(g *ssa.Go, callee *ssa.Function, globals map[*ssa.Global]bool)
 					name = callee.FreeVars[i].Name()
 				}
 				add(bind, "captured free variable "+name)
-				if i < len(callee.FreeVars) {
+				if i < len(callee.FreeVars) && !isGlobalObject(bind) {
 					add(callee.FreeVars[i], "captured free variable "+name)
 				}
 			}
@@ -199,16 +201,24 @@ func expandRootAliases(roots []sharedRoot, funcs map[*ssa.Function]bool) []share
 							param = cal.Params[i]
 						}
 						paramSeen := param != nil && seen[param]
+						// Method receivers / params that are only a package
+						// global under another SSA name are freeze-owned.
+						// Expanding them here causes shared_mem false positives
+						// at unrelated go sites and can merge distinct heap
+						// objects with the global through a shared Param.
+						argIsGlobal := isGlobalObject(arg) || (argObj != nil && isGlobalObject(argObj))
 						if argSeen {
-							if param != nil {
-								add(param, "alias of shared argument")
-							}
-							add(arg, "alias of shared argument")
-							if argObj != nil {
-								add(argObj, "alias of shared argument")
+							if !argIsGlobal {
+								if param != nil {
+									add(param, "alias of shared argument")
+								}
+								add(arg, "alias of shared argument")
+								if argObj != nil {
+									add(argObj, "alias of shared argument")
+								}
 							}
 						}
-						if paramSeen {
+						if paramSeen && !argIsGlobal {
 							add(arg, "alias of shared parameter")
 							if argObj != nil {
 								add(argObj, "alias of shared parameter")
@@ -223,6 +233,21 @@ func expandRootAliases(roots []sharedRoot, funcs map[*ssa.Function]bool) []share
 		}
 	}
 	return out
+}
+
+// isGlobalObject reports whether v names a package global (possibly through
+// FieldAddr / load / conversion stripping).
+func isGlobalObject(v ssa.Value) bool {
+	if v == nil {
+		return false
+	}
+	if _, ok := v.(*ssa.Global); ok {
+		return true
+	}
+	if _, ok := stripToObject(v).(*ssa.Global); ok {
+		return true
+	}
+	return false
 }
 
 // sameObjectRoot strips conversions/loads that stay within one allocated

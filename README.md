@@ -54,7 +54,8 @@ doubt, it **rejects**):
      **provably read-only**, be `*sync.WaitGroup` / `*sync.Once` / `*sync.Mutex`,
      or pass the **guard cascade**:
      1. **one tied** `sync.Mutex` field in the **same or parent struct**,
-        always locked at every access;
+        always locked at every access (including custom `Lock`/`Unlock`
+        methods that always wrap that field);
      2. **one free-standing package** `sync.Mutex` / `*sync.Mutex` held at
         every access of that object;
      3. **`sync.RWMutex` discipline** (tied or free-standing): every write
