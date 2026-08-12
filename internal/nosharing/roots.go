@@ -76,18 +76,6 @@ func collectRoots(g *ssa.Go, callee *ssa.Function, globals map[*ssa.Global]bool)
 	return roots
 }
 
-// nonGlobalRoots filters out package globals (handled by freeze analysis).
-func nonGlobalRoots(roots []sharedRoot) []sharedRoot {
-	var out []sharedRoot
-	for _, r := range roots {
-		if _, ok := r.val.(*ssa.Global); ok {
-			continue
-		}
-		out = append(out, r)
-	}
-	return out
-}
-
 // sharePeers returns focus plus non-global roots that refer to the same
 // shared object identity: same stripToObject, or the same pointer/element
 // type (so Alloc/Param/FreeVar views of one value stay together for tied
