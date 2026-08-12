@@ -108,16 +108,16 @@ doubt, it **rejects**):
    cross-package call. After the first spawn point, globals are frozen:
    **reads stay legal**, and writes are refused unless the guard cascade
    proves a lock/atomic/partition (including a free-standing package mutex
-   held at every touch), a package `sync.Once.Do` body, or an **InitOnly**
+   held at every touch), a fully Once-synchronized global, or an **InitOnly**
    registry helper (`InitOnly` Fact on exported map/slice writers that only
    mutate their receiver and are called only from init/`var`/pre-spawn).
 
-   Soft value-copy API writes (`time.Time` methods, `string`/`[]byte` methods,
-   and curated packages such as `golang.org/x/sync/singleflight`) do not count
-   as shared-memory mutations. Deferred non-mutex calls do not drop held
-   locks. Same-package generic helpers are followed like ordinary callees.
-   After `WaitGroup.Wait`, locals that were only shared into completed waiters
-   (and not written after spawn before Wait) are exclusive again.
+   Soft value-copy API writes (`time.Time` methods and curated packages such
+   as `golang.org/x/sync/singleflight`) do not count as shared-memory
+   mutations. Deferred non-mutex calls do not drop held locks. Same-package
+   generic helpers are followed like ordinary callees. After `WaitGroup.Wait`,
+   locals that were only shared into completed waiters (and not touched by
+   sibling goroutines unsoundly) are exclusive again.
 
 4. **Cross-package share Facts** (`nosharing`)
 
