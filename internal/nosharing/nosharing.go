@@ -279,6 +279,22 @@ func (a *analyzer) checkGoCallee(g *ssa.Go, spawner, callee *ssa.Function, globa
 		if writtenAfter && !writtenInGoro && valueSnapshotReadOnly(root.val, spawner, g) {
 			writtenAfter = false
 		}
+		// WaitGroup fan-out/join: exclusive ownership of result locals after Wait
+		// (also read-only captures while workers run).
+		if writtenInGoro || writtenAfter {
+			wgOK := waitGroupExclusiveOK(root.val, spawner, g, reachable)
+			if !wgOK {
+				for _, peer := range sharePeers(root.val, roots) {
+					if waitGroupExclusiveOK(peer.val, spawner, g, reachable) {
+						wgOK = true
+						break
+					}
+				}
+			}
+			if wgOK {
+				continue
+			}
+		}
 
 		if writtenInGoro || writtenAfter {
 			// Prove over same-object peers only (same strip/type). Package

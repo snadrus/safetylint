@@ -268,6 +268,15 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 			if isWhitelistedSyncMethod(cal, recvOfCall(c)) || isRWMutexMethod(cal) || isSyncMutexMethod(cal) {
 				return
 			}
+			if isStdlibReadOnlyCall(cal) {
+				for _, arg := range c.Args {
+					if derived[arg] && !isMutexFieldAddr(arg) {
+						add(instr, arg, false) // value copy / read-only helper
+						return
+					}
+				}
+				return
+			}
 			if isAtomicCallee(cal) || (cal.Signature.Recv() != nil && isAtomicValueType(cal.Signature.Recv().Type())) {
 				for _, arg := range c.Args {
 					if derived[arg] && !isMutexFieldAddr(arg) {
@@ -277,7 +286,7 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 				}
 				return
 			}
-			if len(cal.Blocks) > 0 && instr.Parent() != nil && cal.Pkg == instr.Parent().Pkg {
+			if len(cal.Blocks) > 0 && instr.Parent() != nil && calleeInPkg(cal, instr.Parent().Pkg) {
 				// Same-package callees are checked via their own parameters
 				// in collectDataAccessesDeep.
 				return
@@ -285,6 +294,11 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 		}
 		for _, arg := range c.Args {
 			if derived[arg] && !isMutexFieldAddr(arg) {
+				// Value copies (Field extract / non-indirect load) are reads.
+				if isValueCopyArg(arg) {
+					add(instr, arg, false)
+					return
+				}
 				add(instr, arg, true)
 				return
 			}
@@ -616,6 +630,13 @@ func applyCallHold(held holdSet, c *ssa.CallCommon, isDefer bool, universe holdS
 				delete(held, g)
 			}
 		}
+		return
+	}
+
+	// Deferred non-mutex calls run at function exit. A deferred closure that
+	// does resp.Body.Close() must not drop freemu holds for the rest of the
+	// body (filUsdPrice pattern).
+	if isDefer {
 		return
 	}
 
@@ -1059,6 +1080,21 @@ func isMutexFieldAddr(v ssa.Value) bool {
 		return false
 	}
 	return isNamedSyncType(fa.Type(), "Mutex", "RWMutex")
+}
+
+// isValueCopyArg reports an SSA value that is a non-addressable copy of data
+// (Field extract or load of a non-indirect type), not a pointer/header cell.
+func isValueCopyArg(v ssa.Value) bool {
+	if v == nil {
+		return false
+	}
+	if _, ok := v.(*ssa.Field); ok {
+		return true
+	}
+	if u, ok := v.(*ssa.UnOp); ok && u.Op == token.MUL {
+		return !typeIsIndirect(u.Type())
+	}
+	return false
 }
 
 // stripToObject walks address computations down to Alloc/Param/FreeVar/Global.

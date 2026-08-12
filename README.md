@@ -68,13 +68,19 @@ doubt, it **rejects**):
      pointer fields of the shared value do not count as writing that value
      (e.g. `cfg.DB.Query` does not write `*Cfg`); module-cache callees export
      `WritesParams` Facts so third-party pointer calls can be evaluated.
-   - **InitOnly** registration helpers (map/slice package globals, no spawn,
-     init-only callers) may write those globals; importers must call them
-     only from `init` / var initializers (`var _ = Reg(…)`).
+   - **InitOnly** registration helpers (package-level **map/slice** globals only,
+     no spawn, init-only callers) may write those tables; importers must call
+     them only from `init` / var initializers (`var _ = Reg(…)`).
    - `[]byte`/`string` payloads and interface method receivers are not assumed
      written by bodyless/interface calls (Broadcast-style fan-out).
    - Dynamic `go fn(…)` is allowed when every same-package assignment to `fn`
      is a known local function/closure; otherwise it is refused.
+   - **WaitGroup fan-out/join**: result locals written by one worker (or
+     read-only during the fan-out) with `Wait` before the parent uses them.
+   - **`sync.Once.Do`** callbacks may write sibling fields of the same object
+     (lazy init). `singleflight.Group` is treated as a sync object.
+   - Deferred non-mutex calls do not drop freemu holds (e.g. `defer` close
+     while a package mutex is held).
    - `mu.TryLock()` / `TryRLock()` only count as an acquire on CFG paths where
      the boolean result is proven true.
    - Values may move between goroutines through **channels**.
@@ -98,7 +104,16 @@ doubt, it **rejects**):
    cross-package call. After the first spawn point, globals are frozen:
    **reads stay legal**, and writes are refused unless the guard cascade
    proves a lock/atomic/partition (including a free-standing package mutex
-   held at every touch).
+   held at every touch), a package `sync.Once.Do` body, or an **InitOnly**
+   registry helper (`InitOnly` Fact on exported map/slice writers that only
+   mutate their receiver and are called only from init/`var`/pre-spawn).
+
+   Soft value-copy API writes (`time.Time` methods, `string`/`[]byte` methods,
+   and curated packages such as `golang.org/x/sync/singleflight`) do not count
+   as shared-memory mutations. Deferred non-mutex calls do not drop held
+   locks. Same-package generic helpers are followed like ordinary callees.
+   After `WaitGroup.Wait`, locals that were only shared into completed waiters
+   (and not written after spawn before Wait) are exclusive again.
 
 4. **Cross-package share Facts** (`nosharing`)
 

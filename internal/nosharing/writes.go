@@ -601,7 +601,27 @@ func receiverIs(c *ssa.CallCommon, v ssa.Value) bool {
 }
 
 func isWhitelistedSync(v ssa.Value) bool {
-	return isNamedSyncType(v.Type(), "WaitGroup", "Once", "Map")
+	if isNamedSyncType(v.Type(), "WaitGroup", "Once", "Map") {
+		return true
+	}
+	return isSingleflightGroup(v.Type())
+}
+
+func isSingleflightGroup(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	t = types.Unalias(t)
+	if p, ok := t.(*types.Pointer); ok {
+		t = types.Unalias(p.Elem())
+	}
+	n, ok := t.(*types.Named)
+	if !ok {
+		return false
+	}
+	obj := n.Obj()
+	return obj != nil && obj.Pkg() != nil &&
+		obj.Pkg().Path() == "golang.org/x/sync/singleflight" && obj.Name() == "Group"
 }
 
 // isShareSafeStdlib reports values whose stdlib type is designed for safe
@@ -686,7 +706,12 @@ func isWhitelistedSyncMethod(fn *ssa.Function, recv ssa.Value) bool {
 	case "Add", "Done", "Wait":
 		return recvMatches("WaitGroup") || recvTypeIs(fn, "WaitGroup")
 	case "Do":
-		return recvMatches("Once") || recvTypeIs(fn, "Once")
+		if recvMatches("Once") || recvTypeIs(fn, "Once") {
+			return true
+		}
+		return (recv != nil && isSingleflightGroup(recv.Type())) || isSingleflightGroup(fn.Signature.Recv().Type())
+	case "DoChan", "Forget":
+		return (recv != nil && isSingleflightGroup(recv.Type())) || isSingleflightGroup(fn.Signature.Recv().Type())
 	case "Load", "Store", "LoadOrStore", "LoadAndDelete", "Delete", "Swap", "CompareAndSwap", "Range", "Clear":
 		return recvMatches("Map") || recvTypeIs(fn, "Map")
 	}

@@ -69,14 +69,31 @@ func (a *analyzer) fnIsRegistryInitHelper(fn *ssa.Function) bool {
 		for _, instr := range b.Instrs {
 			switch in := instr.(type) {
 			case *ssa.MapUpdate:
-				gl, ok := stripToObject(in.Map).(*ssa.Global)
-				if !ok || gl.Pkg != a.pkg {
+				// Require the map cell itself to be a package Global of map
+				// type. Do not strip through FieldAddr — MapUpdate of
+				// dynamicLocker.notifier must not qualify NewDynamic as InitOnly.
+				gl, ok := in.Map.(*ssa.Global)
+				if !ok {
+					if u, isLoad := in.Map.(*ssa.UnOp); isLoad && u.Op == token.MUL {
+						gl, ok = u.X.(*ssa.Global)
+					}
+				}
+				if !ok || gl.Pkg != a.pkg || !isMapOrSliceType(gl.Type()) {
 					continue
 				}
 				saw = true
 			case *ssa.Store:
-				gl, ok := stripToObject(in.Addr).(*ssa.Global)
-				if !ok || gl.Pkg != a.pkg {
+				gl, ok := in.Addr.(*ssa.Global)
+				if !ok {
+					if u, isLoad := in.Addr.(*ssa.UnOp); isLoad && u.Op == token.MUL {
+						gl, ok = u.X.(*ssa.Global)
+					}
+				}
+				if !ok {
+					// FieldAddr store into a struct global is not a registry table.
+					continue
+				}
+				if gl.Pkg != a.pkg {
 					continue
 				}
 				if !isMapOrSliceType(gl.Type()) {

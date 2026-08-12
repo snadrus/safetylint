@@ -9,9 +9,12 @@ import (
 // stdlibReadOnly lists bodyless GOROOT helpers that only read map/slice
 // arguments (passing a loaded global header is not a freeze write).
 var stdlibReadOnly = map[string]map[string]bool{
+	"time": {
+		"Since": true, "Until": true,
+	},
 	"maps": {
 		"All": true, "Keys": true, "Values": true,
-		"Equal": true, "EqualFunc": true,
+		"equal": true, "equalFunc": true,
 	},
 	"slices": {
 		"All": true, "Values": true,
@@ -19,7 +22,7 @@ var stdlibReadOnly = map[string]map[string]bool{
 		"Index": true, "IndexFunc": true,
 		"BinarySearch": true, "BinarySearchFunc": true,
 		"Clone": true, "Concat": true,
-		"Equal": true, "EqualFunc": true,
+		"equal": true, "equalFunc": true,
 		"Compare": true, "CompareFunc": true,
 		"IsSorted": true, "IsSortedFunc": true,
 		"Max": true, "MaxFunc": true, "Min": true, "MinFunc": true,
