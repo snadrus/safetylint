@@ -90,6 +90,90 @@ func globalWrittenIn(pass *analysis.Pass, gl *ssa.Global, funcs map[*ssa.Functio
 // outside the goroutine: any write in a non-goroutine function other than
 // the spawner, or a write in the spawner that is not proven to happen
 // before the go statement.
+// valueSnapshotReadOnly reports that root is a non-pointer struct/array
+// value whose only spawner-side writes after go are whole-cell reassignments
+// (not field stores). Used for Broadcast-style map-lookup captures.
+func valueSnapshotReadOnly(root ssa.Value, spawner *ssa.Function, g *ssa.Go) bool {
+	if root == nil || spawner == nil || g == nil {
+		return false
+	}
+	switch root.(type) {
+	case *ssa.FreeVar, *ssa.Alloc:
+	default:
+		return false
+	}
+	t := types.Unalias(root.Type())
+	// Closure FreeVars for address-taken locals are often *T pointing at a
+	// heap cell that holds the struct value T.
+	if p, ok := t.(*types.Pointer); ok {
+		t = types.Unalias(p.Elem())
+	}
+	ut := t.Underlying()
+	switch ut.(type) {
+	case *types.Struct, *types.Array:
+	default:
+		return false
+	}
+	return onlyWholeValueReassignAfterGo(root, spawner, g)
+}
+
+func onlyWholeValueReassignAfterGo(root ssa.Value, fn *ssa.Function, g *ssa.Go) bool {
+	goBlock := g.Block()
+	goIdx := instrIndex(goBlock, g)
+	derived := deriveOwnAddrs(root, map[*ssa.Function]bool{fn: true})
+	saw := false
+	for v := range derived {
+		refs := v.Referrers()
+		if refs == nil {
+			continue
+		}
+		for _, ref := range *refs {
+			if ref.Parent() != fn {
+				continue
+			}
+			st, ok := ref.(*ssa.Store)
+			if !ok || st.Addr != v {
+				// Any non-store write-like use after go fails the snapshot shape.
+				if isWriteInstr(ref, v) {
+					rb := ref.Block()
+					ri := instrIndex(rb, ref)
+					if rb == goBlock && ri < goIdx {
+						continue
+					}
+					if rb != goBlock && rb.Dominates(goBlock) && !blockInCycle(rb) {
+						continue
+					}
+					return false
+				}
+				continue
+			}
+			// Field/index stores mutate the snapshot in place — not a reassignment.
+			switch st.Addr.(type) {
+			case *ssa.FieldAddr, *ssa.IndexAddr:
+				rb := st.Block()
+				ri := instrIndex(rb, st)
+				if rb == goBlock && ri < goIdx {
+					continue
+				}
+				if rb != goBlock && rb.Dominates(goBlock) && !blockInCycle(rb) {
+					continue
+				}
+				return false
+			}
+			rb := st.Block()
+			ri := instrIndex(rb, st)
+			if rb == goBlock && ri < goIdx {
+				continue
+			}
+			if rb != goBlock && rb.Dominates(goBlock) && !blockInCycle(rb) {
+				continue
+			}
+			saw = true
+		}
+	}
+	return saw
+}
+
 func isWrittenAfterGo(root ssa.Value, spawner *ssa.Function, g *ssa.Go, all []*ssa.Function, goro map[*ssa.Function]bool) bool {
 	for _, f := range all {
 		if f == nil || goro[f] {
@@ -162,10 +246,16 @@ func hasWriteNotBefore(root ssa.Value, fn *ssa.Function, g *ssa.Go) bool {
 // deriveAddrs collects addresses/values derived from root within funcs.
 // It scans instructions directly (rather than walking Referrers) so that
 // Global roots, which do not track referrers, are handled uniformly.
+// Growth is capped to avoid pathological alias explosion on large packages.
+const maxDeriveAddrs = 4096
+
 func deriveAddrs(root ssa.Value, funcs map[*ssa.Function]bool) map[ssa.Value]bool {
 	out := map[ssa.Value]bool{root: true}
 	for changed := true; changed; {
 		changed = false
+		if len(out) >= maxDeriveAddrs {
+			break
+		}
 		for fn := range funcs {
 			if fn == nil {
 				continue
@@ -179,6 +269,9 @@ func deriveAddrs(root ssa.Value, funcs map[*ssa.Function]bool) map[ssa.Value]boo
 					if derivesFrom(instr, out) {
 						out[v] = true
 						changed = true
+						if len(out) >= maxDeriveAddrs {
+							return out
+						}
 					}
 				}
 			}
@@ -374,8 +467,32 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 		return false
 	}
 
+	// Interface method call: the iface value itself is not mutated; []byte /
+	// string payloads are treated as read-only unless a concrete body says
+	// otherwise (Broadcast-style fan-out of immutable messages).
+	if c.IsInvoke() {
+		if c.Value == v {
+			return false
+		}
+		if argOrRecvIs(c, v) && isReadOnlyPayloadType(v.Type()) {
+			return false
+		}
+	}
+
 	callee := c.StaticCallee()
 	if callee != nil {
+		if isShareSafeStdlib(v) {
+			return false
+		}
+		if isAtomicCallee(callee) {
+			// Atomic ops mutate the atomic cell. Count as writes so share/freeze
+			// sites must prove atomics-only (or a lock) rather than treating
+			// them as read-only no-ops. Freeze still skips them in globalWrites.
+			return true
+		}
+		if isStdlibReadOnlyCall(callee) {
+			return false
+		}
 		if isWhitelistedSyncMethod(callee, v) {
 			return false
 		}
@@ -394,15 +511,45 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 		if known, writes := writesParamsFact(pass, c, v); known {
 			return writes
 		}
-		// Still unknown: pessimistic.
+		// Still unknown: pessimistic. ([]byte/string read-only defaults apply
+		// only to interface invokes above — not arbitrary bodyless APIs.)
 		if pessimistic && argOrRecvIs(c, v) {
 			return true
 		}
 		return false
 	}
 
+	if isShareSafeStdlib(v) {
+		return false
+	}
+	// Func values / unknown callees: keep []byte/string as read-only payloads
+	// (Broadcast ErrorHook-style callbacks). Bodyless static APIs above stay
+	// pessimistic so mutate([]byte) is still a write.
+	if argOrRecvIs(c, v) && isReadOnlyPayloadType(v.Type()) {
+		return false
+	}
 	if pessimistic && argOrRecvIs(c, v) {
 		return true
+	}
+	return false
+}
+
+// isReadOnlyPayloadType reports []byte / string (and aliases) that are
+// shared as immutable message payloads. *[]byte is not included — the
+// header cell itself may be reassigned.
+func isReadOnlyPayloadType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	t = types.Unalias(t)
+	if b, ok := t.Underlying().(*types.Basic); ok {
+		return b.Kind() == types.String || b.Kind() == types.UntypedString
+	}
+	if s, ok := t.Underlying().(*types.Slice); ok {
+		elem := types.Unalias(s.Elem()).Underlying()
+		if b, ok := elem.(*types.Basic); ok {
+			return b.Kind() == types.Byte || b.Kind() == types.Uint8
+		}
 	}
 	return false
 }
@@ -454,7 +601,69 @@ func receiverIs(c *ssa.CallCommon, v ssa.Value) bool {
 }
 
 func isWhitelistedSync(v ssa.Value) bool {
-	return isNamedSyncType(v.Type(), "WaitGroup", "Once")
+	if isNamedSyncType(v.Type(), "WaitGroup", "Once", "Map") {
+		return true
+	}
+	return isSingleflightGroup(v.Type())
+}
+
+func isSingleflightGroup(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	t = types.Unalias(t)
+	if p, ok := t.(*types.Pointer); ok {
+		t = types.Unalias(p.Elem())
+	}
+	n, ok := t.(*types.Named)
+	if !ok {
+		return false
+	}
+	obj := n.Obj()
+	return obj != nil && obj.Pkg() != nil &&
+		obj.Pkg().Path() == "golang.org/x/sync/singleflight" && obj.Name() == "Group"
+}
+
+// isShareSafeStdlib reports values whose stdlib type is designed for safe
+// concurrent sharing without a caller-held sync.Mutex (context.Context and
+// *net/http.Server's Serve/Shutdown protocol).
+func isShareSafeStdlib(v ssa.Value) bool {
+	if v == nil {
+		return false
+	}
+	return isContextType(v.Type()) || isHTTPServerType(v.Type())
+}
+
+func isContextType(t types.Type) bool {
+	t = types.Unalias(t)
+	// Closure captures of interfaces are *Context.
+	if p, ok := t.(*types.Pointer); ok {
+		t = types.Unalias(p.Elem())
+	}
+	n, ok := t.(*types.Named)
+	if !ok {
+		return false
+	}
+	obj := n.Obj()
+	return obj != nil && obj.Pkg() != nil && obj.Pkg().Path() == "context" && obj.Name() == "Context"
+}
+
+func isHTTPServerType(t types.Type) bool {
+	t = types.Unalias(t)
+	// FreeVar of *Server is **Server.
+	for {
+		p, ok := t.(*types.Pointer)
+		if !ok {
+			break
+		}
+		t = types.Unalias(p.Elem())
+	}
+	n, ok := t.(*types.Named)
+	if !ok {
+		return false
+	}
+	obj := n.Obj()
+	return obj != nil && obj.Pkg() != nil && obj.Pkg().Path() == "net/http" && obj.Name() == "Server"
 }
 
 func isMutexLike(v ssa.Value) bool {
@@ -497,7 +706,14 @@ func isWhitelistedSyncMethod(fn *ssa.Function, recv ssa.Value) bool {
 	case "Add", "Done", "Wait":
 		return recvMatches("WaitGroup") || recvTypeIs(fn, "WaitGroup")
 	case "Do":
-		return recvMatches("Once") || recvTypeIs(fn, "Once")
+		if recvMatches("Once") || recvTypeIs(fn, "Once") {
+			return true
+		}
+		return (recv != nil && isSingleflightGroup(recv.Type())) || isSingleflightGroup(fn.Signature.Recv().Type())
+	case "DoChan", "Forget":
+		return (recv != nil && isSingleflightGroup(recv.Type())) || isSingleflightGroup(fn.Signature.Recv().Type())
+	case "Load", "Store", "LoadOrStore", "LoadAndDelete", "Delete", "Swap", "CompareAndSwap", "Range", "Clear":
+		return recvMatches("Map") || recvTypeIs(fn, "Map")
 	}
 	return false
 }

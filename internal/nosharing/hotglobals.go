@@ -40,7 +40,9 @@ func (a *analyzer) computeInitConcurrent() bool {
 		}
 		for _, b := range fn.Blocks {
 			for _, instr := range b.Instrs {
-				if a.isSpawnEvent(instr, spawner) || a.isAsyncRegistration(instr) {
+				// HandleFunc/Handle register callbacks but do not start
+				// goroutines; only true spawn events freeze the package.
+				if a.isSpawnEvent(instr, spawner) {
 					return true
 				}
 			}
@@ -265,7 +267,7 @@ func (a *analyzer) checkInitForeignGlobals(reported map[string]bool) {
 		return
 	}
 	for _, goro := range a.initGoroutineFuncs() {
-		heldCache := map[*ssa.Function]map[ssa.Instruction]map[guardKey]bool{}
+		heldCache := map[*ssa.Function]map[ssa.Instruction]holdSet{}
 		for fn := range goro {
 			if fn == nil {
 				continue
@@ -284,7 +286,7 @@ func (a *analyzer) checkInitForeignGlobals(reported map[string]bool) {
 	}
 }
 
-func (a *analyzer) refuseOrAllowForeignHot(gl *ssa.Global, instr ssa.Instruction, heldCache map[*ssa.Function]map[ssa.Instruction]map[guardKey]bool, reported map[string]bool) {
+func (a *analyzer) refuseOrAllowForeignHot(gl *ssa.Global, instr ssa.Instruction, heldCache map[*ssa.Function]map[ssa.Instruction]holdSet, reported map[string]bool) {
 	pos := instr.Pos()
 	name := gl.Name()
 	pkgPath := ""
@@ -368,7 +370,7 @@ func (a *analyzer) refuseOrAllowForeignHot(gl *ssa.Global, instr ssa.Instruction
 		once("init goroutine accesses foreign hot global %s.%s without holding its tied sync.Mutex", pkgPath, name)
 		return
 	}
-	acc := dataAccess{instr: instr, addr: globalAccessAddr(instr, gl)}
+	acc := dataAccess{instr: instr, addr: globalAccessAddr(instr, gl), write: instrWritesGlobal(instr, gl)}
 	if accessProtectedBy(acc, at, tied) {
 		return
 	}

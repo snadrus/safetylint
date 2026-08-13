@@ -9,11 +9,12 @@ strict sharing discipline. Add it to your CI.
 Go without `unsafe` / cgo is memory-safe when single-threaded, but not when
 goroutines share mutable memory. safetylint refuses the escape hatches and
 then refuses cross-goroutine sharing except via channels with
-**freeze-after-send** for pointer-carrying values, or via a **proven
-always-held `sync.Mutex`** embedded in the same (or parent) struct as the data.
+**freeze-after-send** for pointer-carrying values, or via a **proven guard**:
+tied/`free-standing` mutexes, RWMutex Lock/RLock discipline, atomics-only
+touches, or const-index partitioned buffer writers.
 
-Note: *Exotic* mutex usage simply fails. Just like Escape analysis, 
-if you feel like getting complicated, I just haven't implemented your case yet. PRs are welcomed. Keep mutexes near their data. Keep things in-package. 
+Note: *Exotic* locking simply fails. Just like Escape analysis,
+if you feel like getting complicated, I just haven't implemented your case yet. PRs are welcomed. Keep things in-package when you can. 
 
 ## Install / run
 
@@ -22,6 +23,14 @@ go install safetylint/cmd/safetylint@latest   # once published
 # or from this repo:
 go build -o safetylint ./cmd/safetylint
 ./safetylint ./...
+```
+
+Pass the same `-tags` you use for `go build` so constrained files match the
+binary (comma- or space-separated). Example matching Curio’s `make curio-pdp`
+/ `make skiff`:
+
+```bash
+./safetylint -tags "cunative nosupraseal skiff" -test=false ./cmd/skiff
 ```
 
 Exit status is non-zero if any diagnostic is reported (via `multichecker`).
@@ -37,25 +46,51 @@ doubt, it **rejects**):
    - no `.s` assembly in the package
    - no `//go:linkname` or `//go:cgo_*` directives
    - no `reflect` pointer laundering (`UnsafePointer`, `SliceHeader`, …)
+   - Escape-hatch hits report that the code is **not verified**: check its
+     safety and the adapter's safety yourself.
 
 2. **No racy shared memory** (`nosharing`)
    - Memory shared with a goroutine via capture, argument, or global must be
      **provably read-only**, be `*sync.WaitGroup` / `*sync.Once` / `*sync.Mutex`,
-     or be guarded by **one tied** `sync.Mutex` field in the **same or parent
-     struct** that is **always locked** at every access (reads and writes).
+     or pass the **guard cascade**:
+     1. **one tied** `sync.Mutex` field in the **same or parent struct**,
+        always locked at every access (including custom `Lock`/`Unlock`
+        methods that always wrap that field);
+     2. **one free-standing package** `sync.Mutex` / `*sync.Mutex` held at
+        every access of that object;
+     3. **`sync.RWMutex` discipline** (tied or free-standing): every write
+        under `Lock`, every read under `Lock` or `RLock`;
+     4. **atomics-only** concurrent touches (`sync/atomic`);
+     5. **const-index partitioned** slice/array writers (disjoint indexes,
+        no concurrent reads / header mutation).
      Different mutex fields of the same struct are not interchangeable.
      Writes through separately heap-allocated objects reached only via
      pointer fields of the shared value do not count as writing that value
      (e.g. `cfg.DB.Query` does not write `*Cfg`); module-cache callees export
      `WritesParams` Facts so third-party pointer calls can be evaluated.
-   - `mu.TryLock()` only counts as an acquire on CFG paths where its boolean
-     result is proven true (e.g. `if mu.TryLock() { ... }` or
-     `ok := mu.TryLock(); if !ok { return }; ...`).
+   - **InitOnly** registration helpers (package-level **map/slice** globals only,
+     no spawn, init-only callers) may write those tables; importers must call
+     them only from `init` / var initializers (`var _ = Reg(…)`).
+   - `[]byte`/`string` payloads on **interface invokes** and unknown func
+     values are treated as read-only (Broadcast-style fan-out). Ordinary
+     bodyless static APIs stay pessimistic (a `mutate([]byte)` helper is a write).
+   - Dynamic `go fn(…)` is allowed when every same-package assignment to `fn`
+     is a known local function/closure through **unexported** paths; exported
+     setters/params cannot complete the set. Otherwise it is refused.
+   - **WaitGroup fan-out/join**: result locals written by one worker (or
+     read-only during the fan-out) with `Wait` before the parent uses them;
+     a writing worker may not share the cell with a sibling reader/writer.
+   - **`sync.Once`**: a global is exempt from freeze only when **every**
+     non-Once access is Once-synchronized (inside `Do` or dominated by `Do`
+     on that object). `singleflight.Group` is treated as a sync object.
+   - Deferred non-mutex calls do not drop freemu holds (e.g. `defer` close
+     while a package mutex is held).
+   - `mu.TryLock()` / `TryRLock()` only count as an acquire on CFG paths where
+     the boolean result is proven true.
    - Values may move between goroutines through **channels**.
    - If a sent value contains pointers, those pointees are **frozen after
      send**: neither sender nor receiver may write through them afterward.
    - Pointer-free values copied by a channel may be mutated freely after send.
-   - `sync.RWMutex`-guarded sharing is **refused**.
 
 3. **Globals are init-then-freeze** (`nosharing`)
 
@@ -67,12 +102,25 @@ doubt, it **rejects**):
      (unexported or in `package main`, address never taken, never a
      goroutine body).
 
-   A *spawn point* is any `go` statement, any dynamic/interface call, any
+   A *spawn point* is any `go` statement, any dynamic func-value call, any
    Fact-bearing spawner (`MaySpawn` / `MayShareParams`), or a curated stdlib
-   server API (`http.ListenAndServe`, `Serve`, …) — not every Fact-less
-   cross-package call. After the first spawn point, globals are frozen:
-   **reads stay legal**, and writes are refused unless the global is a struct
-   with an embedded `sync.Mutex` whose accesses are all proven locked.
+   server API (`http.ListenAndServe`, `Serve`, …) — not `http.HandleFunc` /
+   `Handle` registration, and not every Fact-less or interface method call.
+   After the first spawn point, globals are frozen:
+   **reads stay legal**, and writes are refused unless the guard cascade
+   proves a lock/atomic/partition (including a free-standing package mutex
+   held at every touch), a fully Once-synchronized global, or an **InitOnly**
+   registry helper (`InitOnly` Fact on exported map/slice writers that only
+   mutate their receiver and are called only from init/`var`/pre-spawn).
+
+   Soft value-copy API writes (`time.Time` methods and curated packages such
+   as `golang.org/x/sync/singleflight`) do not count as shared-memory
+   mutations. Deferred non-mutex calls do not drop held locks. Same-package
+   generic helpers are followed like ordinary callees. After `WaitGroup.Wait`,
+   locals that were only shared into completed waiters (and not touched by
+   sibling goroutines unsoundly) are exclusive again. Fan-out under a
+   WaitGroup may also share cells guarded by a **stack-local** free-standing
+   mutex for the concurrent window; post-Wait parent access is exclusive.
 
 4. **Cross-package share Facts** (`nosharing`)
 
@@ -110,9 +158,9 @@ func (c *Counter) Inc() {
 }
 ```
 
-A free-standing `sync.Mutex` beside unrelated data (not a field of the same
-struct) does **not** count as a guard. If a struct has multiple mutex fields,
-every access of a shared field must use the **same** tied mutex.
+A free-standing package-level `sync.Mutex` counts when that **same** mutex is
+held at every access of the shared object. If a struct has multiple mutex
+fields, every access of a shared field must use the **same** tied mutex.
 
 ## Examples
 
@@ -136,13 +184,10 @@ safetylint prefers false rejections over missed races:
 
 - Mutex proofs are **intra-procedural**: the lock and the access must be in
   the same function (caller-held locks are not inferred). Across functions,
-  one **tied** mutex field (same struct type + field) must protect every
-  touchpoint of the shared memory.
-- `TryLock` is not treated as an unconditional acquire; only paths where the
+  one **tied** mutex field (same struct type + field), or one free-standing
+  package mutex, must protect every touchpoint of the shared memory.
+- `TryLock` / `TryRLock` are not unconditional acquires; only paths where the
   result is proven true acquire the guard.
-- Only **struct-embedded** `sync.Mutex` fields guard data; free-standing
-  mutexes do not.
-- `sync.RWMutex` is never accepted as a guard.
 - Ownership hand-off where the **receiver** mutates channel-sent pointers is
   rejected (freeze-after-send, not transfer-of-mutability).
 - Dynamic `go` callees (interfaces / function values) are rejected.
@@ -153,6 +198,8 @@ safetylint prefers false rejections over missed races:
 - Stdlib / GOROOT packages are skipped for Fact export; curated async APIs
   (`time.AfterFunc`, `http.HandleFunc`, …) still share callback captures.
   Other hidden stdlib spawn+retain APIs remain a limitation until listed.
+  Running on a Go toolchain newer than this tool's verified version warns
+  that faults via new standard funcs may be possible.
 - Exported functions in library packages may never write plain globals once
   the package spawns goroutines anywhere: other packages could call them
   concurrently.

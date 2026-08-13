@@ -15,7 +15,7 @@ func (c *Counter) Inc() {
 
 func Race() int {
 	c := &Counter{}
-	go c.Inc() // want `shared memory .* written without channel transfer and no always-locked sync.Mutex guard`
+	go c.Inc() // want `shared memory .* written without channel transfer and no proven lock/atomic/partition guard`
 	// Unlocked read races with Inc's write.
 	return c.n
 }

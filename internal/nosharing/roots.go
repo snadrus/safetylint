@@ -24,7 +24,9 @@ func collectRoots(g *ssa.Go, callee *ssa.Function, globals map[*ssa.Global]bool)
 
 	// Closure free variables (captures). Prefer the FreeVar inside the
 	// callee for write detection; also keep the binding so spawner-side
-	// writes after go are visible.
+	// writes after go are visible. Package globals are freeze-owned: do
+	// not also treat a FreeVar cell that merely names a global as a
+	// separate shared heap root.
 	if common := g.Common(); common != nil {
 		if mc, ok := common.Value.(*ssa.MakeClosure); ok {
 			for i, bind := range mc.Bindings {
@@ -33,7 +35,7 @@ func collectRoots(g *ssa.Go, callee *ssa.Function, globals map[*ssa.Global]bool)
 					name = callee.FreeVars[i].Name()
 				}
 				add(bind, "captured free variable "+name)
-				if i < len(callee.FreeVars) {
+				if i < len(callee.FreeVars) && !isGlobalObject(bind) {
 					add(callee.FreeVars[i], "captured free variable "+name)
 				}
 			}
@@ -76,16 +78,308 @@ func collectRoots(g *ssa.Go, callee *ssa.Function, globals map[*ssa.Global]bool)
 	return roots
 }
 
+// sharePeers returns focus plus non-global roots that refer to the same
+// shared object identity: same stripToObject, or the same pointer/element
+// type (so Alloc/Param/FreeVar views of one value stay together for tied
+// mutex and partition proofs without pulling in unrelated aliases).
+func sharePeers(focus ssa.Value, roots []sharedRoot) []sharedRoot {
+	if focus == nil {
+		return nil
+	}
+	focusObj := stripToObject(focus)
+	focusTy := focus.Type().String()
+	seen := map[ssa.Value]bool{}
+	var out []sharedRoot
+	add := func(r sharedRoot) {
+		if r.val == nil || seen[r.val] {
+			return
+		}
+		if _, ok := r.val.(*ssa.Global); ok {
+			return
+		}
+		seen[r.val] = true
+		out = append(out, r)
+	}
+	add(sharedRoot{val: focus, reason: "focus"})
+	for _, r := range roots {
+		if r.val == nil {
+			continue
+		}
+		if r.val == focus || stripToObject(r.val) == focusObj {
+			add(r)
+			continue
+		}
+		if r.val.Type().String() == focusTy {
+			add(r)
+		}
+	}
+	return out
+}
+
+// sameObjectPeersGo returns roots that alias the same cell as focus (Alloc /
+// Global / FreeVar / Parameter bindings), excluding unrelated same-type locals.
+func sameObjectPeersGo(focus ssa.Value, roots []sharedRoot, spawner *ssa.Function, g *ssa.Go, allFuncs map[*ssa.Function]bool) []sharedRoot {
+	if focus == nil {
+		return nil
+	}
+	funcs := allFuncs
+	if funcs == nil {
+		funcs = map[*ssa.Function]bool{}
+		if spawner != nil {
+			funcs[spawner] = true
+		}
+		for _, r := range roots {
+			if r.val != nil && r.val.Parent() != nil {
+				funcs[r.val.Parent()] = true
+			}
+		}
+	}
+	cells := map[ssa.Value]bool{focus: true}
+	if obj := stripToObject(focus); obj != nil {
+		cells[obj] = true
+	}
+	// Fixpoint: chase Alloc↔Parameter↔FreeVar aliases through call/go sites.
+	for changed := true; changed; {
+		changed = false
+		add := func(v ssa.Value) {
+			if v == nil || cells[v] {
+				return
+			}
+			cells[v] = true
+			changed = true
+		}
+		snapshot := make([]ssa.Value, 0, len(cells))
+		for c := range cells {
+			snapshot = append(snapshot, c)
+		}
+		for _, c := range snapshot {
+			for _, x := range closureBindingCells(spawner, c) {
+				add(x)
+			}
+			for _, x := range goParamBindings(g, c) {
+				add(x)
+			}
+			for _, p := range paramsReceivingCell(c, funcs) {
+				add(p)
+			}
+			for _, x := range argsPassedAs(c, funcs) {
+				add(x)
+				add(stripToObject(x))
+			}
+			if g != nil {
+				for i, arg := range g.Common().Args {
+					if arg == c || stripToObject(arg) == c || stripToObject(arg) == stripToObject(c) {
+						add(arg)
+						add(stripToObject(arg))
+						if cal := staticCallee(g.Common()); cal != nil && i < len(cal.Params) {
+							add(cal.Params[i])
+						}
+					}
+				}
+			}
+		}
+		for _, r := range roots {
+			if r.val == nil {
+				continue
+			}
+			if fv, ok := r.val.(*ssa.FreeVar); ok {
+				for _, b := range closureBindingCells(spawner, fv) {
+					if cells[b] {
+						add(fv)
+					}
+				}
+			}
+			if cells[stripToObject(r.val)] {
+				add(r.val)
+			}
+		}
+	}
+	seen := map[ssa.Value]bool{}
+	var out []sharedRoot
+	addRoot := func(r sharedRoot) {
+		if r.val == nil || seen[r.val] {
+			return
+		}
+		if _, ok := r.val.(*ssa.Global); ok {
+			return
+		}
+		seen[r.val] = true
+		out = append(out, r)
+	}
+	addRoot(sharedRoot{val: focus, reason: "focus"})
+	for _, r := range roots {
+		if r.val == nil {
+			continue
+		}
+		if cells[r.val] || cells[stripToObject(r.val)] {
+			addRoot(r)
+		}
+	}
+	// Also synthesize peers for aliased Parameters/Allocs not already in roots
+	// so their accesses join the mutex proof.
+	for c := range cells {
+		switch c.(type) {
+		case *ssa.Parameter, *ssa.Alloc, *ssa.FreeVar:
+			addRoot(sharedRoot{val: c, reason: "alias"})
+		}
+	}
+	return out
+}
+
+// argsPassedAs returns concrete arguments passed to Parameter cell at call sites.
+func argsPassedAs(cell ssa.Value, funcs map[*ssa.Function]bool) []ssa.Value {
+	p, ok := cell.(*ssa.Parameter)
+	if !ok || p.Parent() == nil {
+		return nil
+	}
+	parent := p.Parent()
+	idx := -1
+	for i, param := range parent.Params {
+		if param == p {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil
+	}
+	var out []ssa.Value
+	for fn := range funcs {
+		if fn == nil {
+			continue
+		}
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				var c *ssa.CallCommon
+				switch in := instr.(type) {
+				case *ssa.Call:
+					c = in.Common()
+				case *ssa.Defer:
+					c = in.Common()
+				case *ssa.Go:
+					c = in.Common()
+				default:
+					continue
+				}
+				cal := c.StaticCallee()
+				if cal != parent && (cal == nil || cal.Origin() != parent) {
+					continue
+				}
+				if idx >= len(c.Args) {
+					continue
+				}
+				out = append(out, c.Args[idx])
+			}
+		}
+	}
+	return out
+}
+
+// paramsReceivingCell finds Parameters of callees in funcs that are passed cell
+// at a static Call/Go/Defer site (same heap identity).
+func paramsReceivingCell(cell ssa.Value, funcs map[*ssa.Function]bool) []*ssa.Parameter {
+	if cell == nil {
+		return nil
+	}
+	seen := map[*ssa.Parameter]bool{}
+	var out []*ssa.Parameter
+	add := func(p *ssa.Parameter) {
+		if p == nil || seen[p] {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	for fn := range funcs {
+		if fn == nil {
+			continue
+		}
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				var c *ssa.CallCommon
+				switch in := instr.(type) {
+				case *ssa.Call:
+					c = in.Common()
+				case *ssa.Defer:
+					c = in.Common()
+				case *ssa.Go:
+					c = in.Common()
+				default:
+					continue
+				}
+				cal := c.StaticCallee()
+				if cal == nil {
+					continue
+				}
+				for i, arg := range c.Args {
+					if stripToObject(arg) != cell || i >= len(cal.Params) {
+						continue
+					}
+					add(cal.Params[i])
+				}
+			}
+		}
+	}
+	return out
+}
+
+// goParamBindings returns Alloc/Global cells passed as the go argument that
+// becomes Parameter focus (or focus itself when not a Parameter).
+func goParamBindings(g *ssa.Go, focus ssa.Value) []ssa.Value {
+	if g == nil || focus == nil {
+		return nil
+	}
+	p, ok := focus.(*ssa.Parameter)
+	if !ok || p.Parent() == nil {
+		return nil
+	}
+	cal := staticCallee(g.Common())
+	if cal == nil {
+		return nil
+	}
+	parent := p.Parent()
+	if cal != parent && (cal.Origin() == nil || cal.Origin() != parent) {
+		if cal.Name() != parent.Name() {
+			return nil
+		}
+	}
+	idx := -1
+	for i, param := range parent.Params {
+		if param == p {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 || idx >= len(g.Common().Args) {
+		return nil
+	}
+	cell := stripToObject(g.Common().Args[idx])
+	if cell == nil {
+		return nil
+	}
+	return []ssa.Value{cell}
+}
+
 // expandRootAliases grows roots to every same-package SSA name for the same
 // shareable objects: allocation sites, parameters that may receive them,
 // free vars and their bindings. Needed so a tied-mutex proof sees every
 // touchpoint after memory enters a shareable state (not only the go-site
 // Param/FreeVar).
+//
+// Alias growth is capped: beyond maxRootAliases the mutex proof fails closed
+// (incomplete alias set) rather than exploding on large packages.
+const maxRootAliases = 128
+
 func expandRootAliases(roots []sharedRoot, funcs map[*ssa.Function]bool) []sharedRoot {
 	seen := map[ssa.Value]bool{}
 	var out []sharedRoot
+	capped := false
 	add := func(v ssa.Value, reason string) {
-		if v == nil || seen[v] {
+		if v == nil || seen[v] || capped {
+			return
+		}
+		if len(out) >= maxRootAliases {
+			capped = true
 			return
 		}
 		seen[v] = true
@@ -96,11 +390,11 @@ func expandRootAliases(roots []sharedRoot, funcs map[*ssa.Function]bool) []share
 		add(stripToObject(r.val), r.reason)
 	}
 
-	for changed := true; changed; {
+	for changed := true; changed && !capped; {
 		changed = false
 		before := len(seen)
 		for fn := range funcs {
-			if fn == nil {
+			if fn == nil || capped {
 				continue
 			}
 			for _, b := range fn.Blocks {
@@ -119,12 +413,17 @@ func expandRootAliases(roots []sharedRoot, funcs map[*ssa.Function]bool) []share
 							continue
 						}
 						for i, bind := range in.Bindings {
-							if !seen[bind] && !seen[stripToObject(bind)] {
+							if i >= len(f.FreeVars) {
 								continue
 							}
-							if i < len(f.FreeVars) {
-								add(f.FreeVars[i], "alias of shared capture")
+							fv := f.FreeVars[i]
+							// Expand from binding→freevar or freevar→binding so
+							// sibling closures capturing the same object share
+							// one alias set (needed for partition proofs).
+							if !seen[bind] && !seen[stripToObject(bind)] && !seen[fv] {
+								continue
 							}
+							add(fv, "alias of shared capture")
 							add(bind, "alias of shared capture")
 							add(stripToObject(bind), "alias of shared capture")
 						}
@@ -146,16 +445,24 @@ func expandRootAliases(roots []sharedRoot, funcs map[*ssa.Function]bool) []share
 							param = cal.Params[i]
 						}
 						paramSeen := param != nil && seen[param]
+						// Method receivers / params that are only a package
+						// global under another SSA name are freeze-owned.
+						// Expanding them here causes shared_mem false positives
+						// at unrelated go sites and can merge distinct heap
+						// objects with the global through a shared Param.
+						argIsGlobal := isGlobalObject(arg) || (argObj != nil && isGlobalObject(argObj))
 						if argSeen {
-							if param != nil {
-								add(param, "alias of shared argument")
-							}
-							add(arg, "alias of shared argument")
-							if argObj != nil {
-								add(argObj, "alias of shared argument")
+							if !argIsGlobal {
+								if param != nil {
+									add(param, "alias of shared argument")
+								}
+								add(arg, "alias of shared argument")
+								if argObj != nil {
+									add(argObj, "alias of shared argument")
+								}
 							}
 						}
-						if paramSeen {
+						if paramSeen && !argIsGlobal {
 							add(arg, "alias of shared parameter")
 							if argObj != nil {
 								add(argObj, "alias of shared parameter")
@@ -170,6 +477,21 @@ func expandRootAliases(roots []sharedRoot, funcs map[*ssa.Function]bool) []share
 		}
 	}
 	return out
+}
+
+// isGlobalObject reports whether v names a package global (possibly through
+// FieldAddr / load / conversion stripping).
+func isGlobalObject(v ssa.Value) bool {
+	if v == nil {
+		return false
+	}
+	if _, ok := v.(*ssa.Global); ok {
+		return true
+	}
+	if _, ok := stripToObject(v).(*ssa.Global); ok {
+		return true
+	}
+	return false
 }
 
 // sameObjectRoot strips conversions/loads that stay within one allocated
@@ -200,7 +522,9 @@ func sameObjectRoot(v ssa.Value) ssa.Value {
 		case *ssa.Slice:
 			v = x.X
 		case *ssa.Extract:
-			v = x.Tuple
+			// Multi-return extracts are distinct values (e.g. ctx vs cancel
+			// from context.WithCancel); the SSA tuple is not one object.
+			return v
 		case *ssa.Alloc, *ssa.Parameter, *ssa.FreeVar, *ssa.Global:
 			return v
 		default:

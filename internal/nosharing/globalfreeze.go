@@ -106,8 +106,19 @@ func (a *analyzer) checkGlobalFreeze(reported map[string]bool) {
 					}
 				}
 				for _, gl := range gls {
+					// InitOnly helpers may write globals; callers are restricted
+					// to init/var initializers via checkInitOnlyCalls.
+					if a.isInitOnlyFunc(fn) {
+						continue
+					}
+					if a.onceProtectsGlobal(gl) {
+						continue
+					}
+					if isSingleflightGroup(gl.Type()) {
+						continue
+					}
 					if mutexOK[gl] == 0 {
-						if len(findStructuralGuards(gl)) > 0 && mutexGuardsAccesses(gl, allFuncs) {
+						if mutexGuardsAccesses(gl, allFuncs) {
 							mutexOK[gl] = 1
 						} else {
 							mutexOK[gl] = 2
@@ -197,8 +208,7 @@ func (a *analyzer) callSiteIndex() (map[*ssa.Function][]freezeSite, map[*ssa.Fun
 	sites := map[*ssa.Function][]freezeSite{}
 	goBody := map[*ssa.Function]bool{}
 	addrTaken := map[*ssa.Function]bool{}
-	inPkg := func(f *ssa.Function) bool { return f != nil && f.Pkg == a.pkg }
-
+	inPkg := func(f *ssa.Function) bool { return f != nil && (f.Pkg == a.pkg || (f.Origin() != nil && f.Origin().Pkg == a.pkg)) }
 	for _, fn := range a.funcs {
 		if fn == nil {
 			continue
@@ -207,16 +217,22 @@ func (a *analyzer) callSiteIndex() (map[*ssa.Function][]freezeSite, map[*ssa.Fun
 			for _, instr := range b.Instrs {
 				switch in := instr.(type) {
 				case *ssa.Call:
-					if cal := in.Common().StaticCallee(); inPkg(cal) {
-						sites[cal] = append(sites[cal], freezeSite{caller: fn, instr: instr, isDefer: false})
+					if cal := in.Common().StaticCallee(); cal != nil {
+						for _, target := range callSiteTargets(cal, a.pkg) {
+							sites[target] = append(sites[target], freezeSite{caller: fn, instr: instr, isDefer: false})
+						}
 					}
 				case *ssa.Defer:
-					if cal := in.Common().StaticCallee(); inPkg(cal) {
-						sites[cal] = append(sites[cal], freezeSite{caller: fn, instr: instr, isDefer: true})
+					if cal := in.Common().StaticCallee(); cal != nil {
+						for _, target := range callSiteTargets(cal, a.pkg) {
+							sites[target] = append(sites[target], freezeSite{caller: fn, instr: instr, isDefer: true})
+						}
 					}
 				case *ssa.Go:
-					if cal := in.Common().StaticCallee(); inPkg(cal) {
-						goBody[cal] = true
+					if cal := in.Common().StaticCallee(); cal != nil {
+						for _, target := range callSiteTargets(cal, a.pkg) {
+							goBody[target] = true
+						}
 					}
 				case *ssa.MakeClosure:
 					f, _ := in.Fn.(*ssa.Function)
@@ -314,9 +330,9 @@ func (a *analyzer) computeSpawners() map[*ssa.Function]bool {
 }
 
 func (a *analyzer) isSpawnEvent(instr ssa.Instruction, spawner map[*ssa.Function]bool) bool {
-	if a.isAsyncRegistration(instr) {
-		return true
-	}
+	// http.HandleFunc/Handle and similar only register callbacks; they do not
+	// start serving goroutines. Callback captures are still share events via
+	// checkAsyncCallbackShares. Freeze spawn is Serve/ListenAndServe/go/Facts.
 	var c *ssa.CallCommon
 	switch in := instr.(type) {
 	case *ssa.Go:
@@ -334,11 +350,14 @@ func (a *analyzer) isSpawnEvent(instr ssa.Instruction, spawner map[*ssa.Function
 		}
 	}
 	if c.IsInvoke() {
-		// Interface method: callee unknown; may start concurrency.
-		return true
+		// Interface method: unknown callee. Treat like Fact-less cross-package
+		// calls — do not freeze the package (absence of a Fact is not proof a
+		// goroutine started). Sharing of interface values is handled elsewhere.
+		return false
 	}
 	callee := c.StaticCallee()
 	if callee == nil {
+		// Dynamic func value: may start concurrency when invoked.
 		return true
 	}
 	if callee.Pkg == a.pkg {
@@ -496,8 +515,10 @@ func (a *analyzer) globalWritesCall(c *ssa.CallCommon) []*ssa.Global {
 
 	callee := c.StaticCallee()
 	if callee == nil {
-		// Dynamic call: address-of-global or mutable map/slice load only.
-		return a.globalWritesCallArgs(c, true)
+		// Interface/dynamic call: do not treat an invoke on a loaded interface
+		// global (e.g. err.Error()) as writing the global binding. Map/slice
+		// headers still count via globalWritesCallArgs(..., false).
+		return a.globalWritesCallArgs(c, false)
 	}
 	if isSyncMutexMethod(callee) || isRWMutexMethod(callee) {
 		return nil
@@ -505,7 +526,10 @@ func (a *analyzer) globalWritesCall(c *ssa.CallCommon) []*ssa.Global {
 	if isWhitelistedSyncMethod(callee, recvOfCall(c)) {
 		return nil
 	}
-	if callee.Pkg == a.pkg && len(callee.Blocks) > 0 {
+	if isAtomicCallee(callee) || isStdlibReadOnlyCall(callee) {
+		return nil
+	}
+	if calleeInPkg(callee, a.pkg) && len(callee.Blocks) > 0 {
 		for i, arg := range c.Args {
 			if !mayContainPointers(arg.Type()) {
 				continue
@@ -575,8 +599,53 @@ func isMapOrSliceType(t types.Type) bool {
 	if t == nil {
 		return false
 	}
+	if p, ok := t.Underlying().(*types.Pointer); ok {
+		t = p.Elem()
+	}
 	switch t.Underlying().(type) {
 	case *types.Map, *types.Slice:
+		return true
+	}
+	return false
+}
+
+// callSiteTargets returns the callee and its generic origin when both are in pkg.
+func callSiteTargets(cal *ssa.Function, pkg *ssa.Package) []*ssa.Function {
+	if cal == nil || pkg == nil {
+		return nil
+	}
+	var out []*ssa.Function
+	add := func(f *ssa.Function) {
+		if f == nil {
+			return
+		}
+		if f.Pkg == pkg || (f.Origin() != nil && f.Origin().Pkg == pkg) {
+			// Prefer recording the package-local view.
+			if f.Pkg == pkg {
+				out = append(out, f)
+			}
+			if orig := f.Origin(); orig != nil && orig.Pkg == pkg && orig != f {
+				out = append(out, orig)
+			}
+		}
+	}
+	add(cal)
+	return out
+}
+
+// calleeInPkg reports whether cal belongs to pkg, including generic instances
+// whose Origin lives in pkg while cal.Pkg is nil.
+func calleeInPkg(cal *ssa.Function, pkg *ssa.Package) bool {
+	if cal == nil || pkg == nil {
+		return false
+	}
+	if cal.Pkg == pkg {
+		return true
+	}
+	if orig := cal.Origin(); orig != nil && orig.Pkg == pkg {
+		return true
+	}
+	if obj := cal.Object(); obj != nil && obj.Pkg() == pkg.Pkg {
 		return true
 	}
 	return false

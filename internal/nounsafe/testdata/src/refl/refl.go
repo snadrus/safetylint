@@ -3,10 +3,10 @@ package refl
 import "reflect"
 
 func Bad(v reflect.Value) any {
-	return v.UnsafePointer() // want `reflect.UnsafePointer launders pointers and escapes Go memory safety`
+	return v.UnsafePointer() // want `reflect.UnsafePointer is not verified. Check its safety and the adapter's safety yourself`
 }
 
 func Headers() {
-	var _ reflect.SliceHeader  // want `reflect.SliceHeader launders pointers and escapes Go memory safety`
-	var _ reflect.StringHeader // want `reflect.StringHeader launders pointers and escapes Go memory safety`
+	var _ reflect.SliceHeader  // want `reflect.SliceHeader is not verified. Check its safety and the adapter's safety yourself`
+	var _ reflect.StringHeader // want `reflect.StringHeader is not verified. Check its safety and the adapter's safety yourself`
 }

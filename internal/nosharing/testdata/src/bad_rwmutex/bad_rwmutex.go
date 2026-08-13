@@ -8,13 +8,11 @@ type Counter struct {
 }
 
 func (c *Counter) Inc() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.n++
+	c.n++ // unlocked write
 }
 
 func Run() {
 	c := &Counter{}
-	go c.Inc() // want `shared memory .* written without channel transfer and no always-locked sync.Mutex guard|shared sync.RWMutex`
+	go c.Inc() // want `shared memory .* written without channel transfer and no proven lock/atomic/partition guard`
 	c.Inc()
 }

@@ -19,6 +19,6 @@ func (c *Counter) IncBare() {
 
 func Race() {
 	c := &Counter{}
-	go c.IncLocked() // want `shared memory .* written without channel transfer and no always-locked sync.Mutex guard`
+	go c.IncLocked() // want `shared memory .* written without channel transfer and no proven lock/atomic/partition guard`
 	c.IncBare()
 }

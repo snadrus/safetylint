@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 
+	"safetylint/internal/toolver"
+
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
@@ -24,6 +26,9 @@ The nounsafe analyzer refuses constructs that exit Go's type-safe memory model:
   - .s assembly files in the package
   - //go:linkname and //go:cgo_* compiler directives
   - reflect.Value.UnsafePointer/UnsafeAddr and reflect.SliceHeader/StringHeader
+
+Escape-hatch diagnostics state that the code is not verified: check its
+safety and the adapter's safety yourself.
 `
 
 var Analyzer = &analysis.Analyzer{
@@ -34,6 +39,8 @@ var Analyzer = &analysis.Analyzer{
 }
 
 func run(pass *analysis.Pass) (any, error) {
+	toolver.WarnIfTooNew(pass)
+
 	userFiles := make([]*ast.File, 0, len(pass.Files))
 	for _, f := range pass.Files {
 		if isCgoGenerated(pass.Fset.Position(f.Pos()).Filename) {
@@ -48,7 +55,7 @@ func run(pass *analysis.Pass) (any, error) {
 	// Assembly files are a trust hole equivalent to cgo.
 	for _, other := range pass.OtherFiles {
 		if strings.HasSuffix(strings.ToLower(other), ".s") {
-			pass.Reportf(userFiles[0].Package, "assembly file %q escapes Go memory safety (refuse .s)", filepath.Base(other))
+			pass.Reportf(userFiles[0].Package, "assembly file %q is not verified. Check its safety and the adapter's safety yourself", filepath.Base(other))
 			break
 		}
 	}
@@ -69,7 +76,7 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 	}
 	if usesCgo {
-		pass.Reportf(userFiles[0].Package, `import "C" (cgo/extern C) escapes Go memory safety`)
+		pass.Reportf(userFiles[0].Package, `import "C" (cgo/extern C) is not verified. Check its safety and the adapter's safety yourself`)
 	}
 
 	for _, f := range userFiles {
@@ -88,7 +95,7 @@ func run(pass *analysis.Pass) (any, error) {
 				if cgoSource {
 					continue
 				}
-				pass.Reportf(imp.Pos(), `import "unsafe" escapes Go memory safety`)
+				pass.Reportf(imp.Pos(), `import "unsafe" is not verified. Check its safety and the adapter's safety yourself`)
 			case "C":
 				// Already reported at package level when usesCgo; if the AST
 				// still has import "C", report on the import itself instead
@@ -160,9 +167,9 @@ func checkDirectives(pass *analysis.Pass, f *ast.File) {
 			}
 			switch {
 			case name == "linkname":
-				pass.Reportf(c.Pos(), "//go:linkname escapes Go memory safety")
+				pass.Reportf(c.Pos(), "//go:linkname is not verified. Check its safety and the adapter's safety yourself")
 			case strings.HasPrefix(name, "cgo_"):
-				pass.Reportf(c.Pos(), "//go:%s escapes Go memory safety", name)
+				pass.Reportf(c.Pos(), "//go:%s is not verified. Check its safety and the adapter's safety yourself", name)
 			}
 		}
 	}
@@ -179,6 +186,6 @@ func checkReflectObj(pass *analysis.Pass, id *ast.Ident) {
 	}
 	switch obj.Name() {
 	case "UnsafePointer", "UnsafeAddr", "SliceHeader", "StringHeader":
-		pass.Reportf(id.Pos(), "reflect.%s launders pointers and escapes Go memory safety", obj.Name())
+		pass.Reportf(id.Pos(), "reflect.%s is not verified. Check its safety and the adapter's safety yourself", obj.Name())
 	}
 }

@@ -74,6 +74,16 @@ func (*MaySpawn) AFact() {}
 
 func (*MaySpawn) String() string { return "maySpawn" }
 
+// InitOnly is an object Fact on *types.Func: the function may write its
+// defining package's globals but must only be called from init functions
+// or package-level variable initializers (in any importing package).
+// Typical use: registration helpers like var _ = Reg(…).
+type InitOnly struct{}
+
+func (*InitOnly) AFact() {}
+
+func (*InitOnly) String() string { return "initOnly" }
+
 // HotGlobals is a package Fact: globals that init-time goroutines may
 // concurrently access after init returns (and thus after main starts).
 // Writers must use the tied mutex when set, or avoid post-concurrency writes.
