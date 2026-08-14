@@ -118,7 +118,7 @@ func (a *analyzer) checkGlobalFreeze(reported map[string]bool) {
 						continue
 					}
 					if mutexOK[gl] == 0 {
-						if mutexGuardsAccesses(gl, allFuncs) {
+						if a.globalGuardedPostSpawn(gl, allFuncs, roots, preOnly, info) {
 							mutexOK[gl] = 1
 						} else {
 							mutexOK[gl] = 2
@@ -136,6 +136,31 @@ func (a *analyzer) checkGlobalFreeze(reported map[string]bool) {
 			}
 		}
 	}
+}
+
+// globalGuardedPostSpawn proves the guard cascade over gl's accesses,
+// ignoring accesses that provably happen before any goroutine could run
+// (init functions and pre-spawn positions of pre-only helpers): those
+// happen-before every spawn and cannot race, so an unguarded composite
+// initializer must not poison an otherwise mutex-disciplined global.
+func (a *analyzer) globalGuardedPostSpawn(gl *ssa.Global, allFuncs map[*ssa.Function]bool, roots, preOnly map[*ssa.Function]bool, info func(*ssa.Function) *spawnInfo) bool {
+	accesses := collectDataAccessesDeep(gl, allFuncs, map[ssa.Value]bool{})
+	var live []dataAccess
+	for _, acc := range accesses {
+		fn := acc.instr.Parent()
+		if fn != nil && (roots[fn] || preOnly[fn]) {
+			si := info(fn)
+			post := si.post[acc.instr]
+			if _, isDefer := acc.instr.(*ssa.Defer); isDefer {
+				post = si.postAtExit
+			}
+			if !post {
+				continue
+			}
+		}
+		live = append(live, acc)
+	}
+	return accessesGuarded(gl, live, allFuncs)
 }
 
 func (a *analyzer) packageSpawns() bool {

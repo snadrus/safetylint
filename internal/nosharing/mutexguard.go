@@ -9,10 +9,24 @@ import (
 
 // guardKey identifies a sync.Mutex / sync.RWMutex guard within one function's
 // SSA. field >= 0 is a struct field of base; field == -1 is a free-standing
-// package-level Mutex/RWMutex Global (base itself).
+// package-level Mutex/RWMutex Global (base itself). owner, when non-nil, is
+// the struct type that directly contains the mutex field — it differs from
+// base's struct when the mutex lives in a nested/embedded value struct
+// (globalCfg.diff.mu), so field indices of different nesting levels do not
+// collide.
 type guardKey struct {
 	base  ssa.Value
 	field int
+	owner *types.Struct
+}
+
+// guardStruct is the struct type that field indexes into: the explicit owner
+// for nested guards, otherwise the struct behind base.
+func guardStruct(g guardKey) *types.Struct {
+	if g.owner != nil {
+		return g.owner
+	}
+	return structOf(g.base.Type())
 }
 
 // holdMode is the strength of a must-held guard.
@@ -59,11 +73,29 @@ func findStructuralGuardsKind(root ssa.Value, rw bool) []structuralGuard {
 	if rw {
 		fieldsOf = rwMutexFields
 	}
-
-	if st := structOf(root.Type()); st != nil {
+	// Nested value-struct fields (including embedded ones) can hold the
+	// mutex too (globalCfg.diff.mu guarding sibling maps).
+	var addNested func(st *types.Struct, depth int)
+	addNested = func(st *types.Struct, depth int) {
+		if st == nil || depth > 3 {
+			return
+		}
 		for _, fi := range fieldsOf(st) {
 			add(st, fi)
 		}
+		for i := 0; i < st.NumFields(); i++ {
+			ft := types.Unalias(st.Field(i).Type())
+			if isNamedSyncType(ft, "Mutex", "RWMutex") {
+				continue
+			}
+			if inner, ok := ft.Underlying().(*types.Struct); ok {
+				addNested(inner, depth+1)
+			}
+		}
+	}
+
+	if st := structOf(root.Type()); st != nil {
+		addNested(st, 0)
 	}
 
 	for cur := root; cur != nil; {
@@ -82,9 +114,7 @@ func findStructuralGuardsKind(root ssa.Value, rw bool) []structuralGuard {
 			continue
 		case *ssa.FieldAddr:
 			if st := structOf(v.X.Type()); st != nil {
-				for _, fi := range fieldsOf(st) {
-					add(st, fi)
-				}
+				addNested(st, 0)
 			}
 			cur = v.X
 		case *ssa.IndexAddr, *ssa.Slice:
@@ -425,7 +455,7 @@ func accessProtectedBy(acc dataAccess, held holdSet, tied structuralGuard) bool 
 		if g.field < 0 {
 			continue
 		}
-		st := structOf(g.base.Type())
+		st := guardStruct(g)
 		if st == nil {
 			continue
 		}
@@ -731,6 +761,11 @@ func applyCallHold(held holdSet, c *ssa.CallCommon, isDefer bool, universe holdS
 			isWhitelistedSyncMethod(callee, recvOfCall(c)) {
 			return
 		}
+		// Atomic ops and curated read-only stdlib helpers cannot unlock a
+		// mutex; passing &obj.field to them must not kill obj's holds.
+		if isAtomicCallee(callee) || isStdlibReadOnlyCall(callee) {
+			return
+		}
 	}
 	for _, arg := range c.Args {
 		killEscaping(held, arg)
@@ -761,7 +796,7 @@ func calleeMayUnlock(fn *ssa.Function, g guardKey, visited map[*ssa.Function]boo
 		return false
 	}
 	visited[fn] = true
-	gStruct := structOf(g.base.Type())
+	gStruct := guardStruct(g)
 
 	for _, b := range fn.Blocks {
 		for _, instr := range b.Instrs {
@@ -790,11 +825,11 @@ func calleeMayUnlock(fn *ssa.Function, g guardKey, visited map[*ssa.Function]boo
 				if !ok {
 					return true // unlock through an alias we cannot identify
 				}
-				if ug.base == g.base && ug.field == g.field {
+				if ug.base == g.base && ug.field == g.field && guardStruct(ug) == guardStruct(g) {
 					return true
 				}
 				if g.field >= 0 && ug.field == g.field && gStruct != nil {
-					if st := structOf(ug.base.Type()); st != nil && st.String() == gStruct.String() {
+					if st := guardStruct(ug); st != nil && st.String() == gStruct.String() {
 						return true // same struct type+field, unknown base
 					}
 				}
@@ -880,7 +915,11 @@ func lockUnlockGuard(c *ssa.CallCommon) (guardKey, bool) {
 		if (isMu || isLocker) && (name == "RLock" || name == "RUnlock" || name == "TryRLock") {
 			return guardKey{}, false
 		}
-		return guardKey{base: resolveGuardBase(stripToObject(fa.X)), field: fa.Field}, true
+		return guardKey{
+			base:  resolveGuardBase(stripToObject(fa.X)),
+			field: fa.Field,
+			owner: structOf(fa.X.Type()),
+		}, true
 	}
 	// Free-standing Mutex / *Mutex / RWMutex / *RWMutex: package Global or
 	// stack/heap Alloc (fan-out local locks under WaitGroup). Closure FreeVars
@@ -1012,7 +1051,7 @@ func wrapperEntryHold(fn *ssa.Function) holdSet {
 	default:
 		return nil
 	}
-	field, _, ok := mutexWrapperField(fn, name)
+	wf, ok := mutexWrapperField(fn, name)
 	if !ok {
 		return nil
 	}
@@ -1020,7 +1059,7 @@ func wrapperEntryHold(fn *ssa.Function) holdSet {
 	if name == "RUnlock" {
 		mode = holdRead
 	}
-	return holdSet{guardKey{base: fn.Params[0], field: field}: mode}
+	return holdSet{guardKey{base: fn.Params[0], field: wf.field, owner: wf.owner}: mode}
 }
 
 // wrapperLockGuard recognizes user methods named Lock/Unlock/RLock/RUnlock
@@ -1040,32 +1079,34 @@ func wrapperLockGuard(c *ssa.CallCommon, name string, base ssa.Value) (guardKey,
 	if cal == nil || isSyncMutexMethod(cal) || isRWMutexMethod(cal) {
 		return guardKey{}, false
 	}
-	field, isRW, ok := mutexWrapperField(cal, name)
+	wf, ok := mutexWrapperField(cal, name)
 	if !ok {
 		return guardKey{}, false
 	}
-	if !isRW && (name == "RLock" || name == "RUnlock") {
+	if !wf.isRW && (name == "RLock" || name == "RUnlock") {
 		return guardKey{}, false
 	}
-	return guardKey{base: base, field: field}, true
+	return guardKey{base: base, field: wf.field, owner: wf.owner}, true
 }
 
 type wrapperField struct {
+	owner *types.Struct // struct type directly containing the mutex field
 	field int
 	isRW  bool
 }
 
 // mutexWrapperField reports the tied Mutex/RWMutex field that cal always
 // locks or unlocks on its receiver via a direct sync method. Fail closed
-// on Try*, nested non-sync wrappers, or disagreeing fields/paths.
-func mutexWrapperField(cal *ssa.Function, name string) (field int, isRW bool, ok bool) {
+// on Try*, nested non-sync wrappers, ambiguity (more than one field the
+// wrapper must-performs the op on), or disagreeing fields/paths.
+func mutexWrapperField(cal *ssa.Function, name string) (wrapperField, bool) {
 	if cal == nil || len(cal.Blocks) == 0 || cal.Signature.Recv() == nil || len(cal.Params) == 0 {
-		return 0, false, false
+		return wrapperField{}, false
 	}
 	switch name {
 	case "Lock", "Unlock", "RLock", "RUnlock":
 	default:
-		return 0, false, false
+		return wrapperField{}, false
 	}
 	recv := cal.Params[0]
 	opsByBlock := make([]map[wrapperField]bool, len(cal.Blocks))
@@ -1081,7 +1122,7 @@ func mutexWrapperField(cal *ssa.Function, name string) (field int, isRW bool, ok
 				continue
 			}
 			if opName == "TryLock" || opName == "TryRLock" {
-				return 0, false, false
+				return wrapperField{}, false
 			}
 			if opName == name {
 				opsByBlock[b.Index][fk] = true
@@ -1093,17 +1134,28 @@ func mutexWrapperField(cal *ssa.Function, name string) (field int, isRW bool, ok
 		}
 	}
 	if len(candidates) == 0 {
-		return 0, false, false
+		return wrapperField{}, false
 	}
+	var found wrapperField
+	matches := 0
 	for fk := range candidates {
 		if (name == "Lock" || name == "RLock") && wrapperBlockHas(releaseByBlock, fk) {
 			continue // acquire wrapper must not release
 		}
 		if wrapperMustPerform(cal, recv, name, fk, opsByBlock) {
-			return fk.field, fk.isRW, true
+			found = fk
+			matches++
 		}
 	}
-	return 0, false, false
+	if matches != 1 {
+		// Zero: not a wrapper. More than one: ambiguous which mutex the
+		// wrapper stands for (e.g. Unlock that releases the main lock and
+		// also cycles a bookkeeping mutex) — crediting one at random would
+		// leave the other believed-held. Fail closed; must-hold falls back
+		// to calleeMayUnlock for kills.
+		return wrapperField{}, false
+	}
+	return found, true
 }
 
 func wrapperBlockHas(byBlock []map[wrapperField]bool, fk wrapperField) bool {
@@ -1206,7 +1258,7 @@ func recvMutexFieldOp(instr ssa.Instruction, recv ssa.Value) (wrapperField, stri
 	if !isMu && !isRWField {
 		return wrapperField{}, "", false
 	}
-	return wrapperField{field: fa.Field, isRW: isRWField}, opName, true
+	return wrapperField{owner: structOf(fa.X.Type()), field: fa.Field, isRW: isRWField}, opName, true
 }
 
 func mutexRecv(c *ssa.CallCommon) ssa.Value {

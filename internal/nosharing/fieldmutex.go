@@ -37,7 +37,7 @@ func consistentMutexGuards(accesses []dataAccess, funcs map[*ssa.Function]bool) 
 		ok := true
 		rw := isNamedSyncType(g.base.Type(), "RWMutex")
 		if g.field >= 0 {
-			if st := structOf(g.base.Type()); st != nil && g.field < st.NumFields() {
+			if st := guardStruct(g); st != nil && g.field < st.NumFields() {
 				rw = isNamedSyncType(st.Field(g.field).Type(), "RWMutex")
 			}
 		}
@@ -72,7 +72,7 @@ func sameGuard(a, b guardKey) bool {
 		return false
 	}
 	if a.field >= 0 {
-		sa, sb := structOf(a.base.Type()), structOf(b.base.Type())
+		sa, sb := guardStruct(a), guardStruct(b)
 		return sa != nil && sb != nil && sa.String() == sb.String()
 	}
 	ra, rb := resolveGuardBase(a.base), resolveGuardBase(b.base)
@@ -202,6 +202,9 @@ func fieldMutexGuards(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Func
 		return true
 	}
 	for _, group := range byField {
+		if atomicsOnlyAccesses(group) {
+			continue
+		}
 		if !consistentMutexGuards(group, funcs) && !freeStandingMutexGuards(group, funcs, false) && !freeStandingMutexGuards(group, funcs, true) {
 			if !hasTiedMutex(findStructuralGuards(root), group) && !hasTiedMutex(findStructuralRWGuards(root), group) {
 				return false
@@ -230,23 +233,27 @@ func accessFieldIndex(root ssa.Value, acc dataAccess) int {
 	return -1
 }
 
+// fieldIndexFrom returns the index of root's own field that cur addresses,
+// walking FieldAddr chains outward: for root.diff.mu it yields diff's index
+// in root's struct (the outermost hop), so nested fields group with their
+// top-level field rather than colliding on inner indices.
 func fieldIndexFrom(root, cur ssa.Value) int {
 	rootObj := stripToObject(root)
 	rootSt := namedStructOf(root.Type())
+	found := -1
 	for cur != nil {
 		switch x := cur.(type) {
 		case *ssa.FieldAddr:
 			if stripToObject(x.X) == rootObj || x.X == root {
-				return x.Field
-			}
-			// Same named/struct type as root (method receiver vs Alloc).
-			if rootSt != nil && structOf(x.X.Type()) != nil && structOf(x.X.Type()).String() == rootSt.String() {
-				return x.Field
+				found = x.Field
+			} else if rootSt != nil && structOf(x.X.Type()) != nil && structOf(x.X.Type()).String() == rootSt.String() {
+				// Same named/struct type as root (method receiver vs Alloc).
+				found = x.Field
 			}
 			cur = x.X
 		case *ssa.UnOp:
 			if x.Op != token.MUL {
-				return -1
+				return found
 			}
 			cur = x.X
 		case *ssa.IndexAddr:
@@ -258,8 +265,8 @@ func fieldIndexFrom(root, cur ssa.Value) int {
 		case *ssa.Convert:
 			cur = x.X
 		default:
-			return -1
+			return found
 		}
 	}
-	return -1
+	return found
 }

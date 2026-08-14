@@ -123,6 +123,8 @@ func TestNosharing(t *testing.T) {
 		"good_locker",
 		"bad_locker",
 		"bad_readfull",
+		"good_global_nestedmu",
+		"bad_global_nestedmu",
 		"bad_curio_locks",
 		"bad_curio_stride",
 	)
