@@ -2,12 +2,36 @@ package good_curio_locks
 
 import "sync"
 
+// Curio index_locks shape: slot r/w under the slot mutex (canLock←tryLock
+// inherit); refs under Index.lk held across unlock().
 type slot struct {
+	mu   sync.Mutex
 	r    [2]int
 	refs int
 }
 
+func (s *slot) canLock() bool {
+	return s.r[0] == 0
+}
+
+func (s *slot) tryLock() bool {
+	if !s.canLock() {
+		return false
+	}
+	s.r[0]++
+	return true
+}
+
+func (s *slot) lock() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for !s.tryLock() {
+	}
+}
+
 func (s *slot) unlock() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.r[0]--
 }
 
@@ -25,6 +49,8 @@ func (i *Index) lockWith(k int) {
 	}
 	slk.refs++
 	i.lk.Unlock()
+
+	slk.lock()
 
 	go func() {
 		i.lk.Lock()

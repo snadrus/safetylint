@@ -39,7 +39,12 @@ func stridePartitionOK(root ssa.Value, accesses []dataAccess) bool {
 			continue
 		}
 		if isSliceHeaderStore(acc) {
-			return false
+			// Parent make([]T) / header update is setup. A worker that
+			// replaces the shared header races with sibling tiles.
+			if acc.instr.Parent() != nil && acc.instr.Parent().Parent() != nil {
+				return false
+			}
+			continue
 		}
 		if !acc.write {
 			reads = append(reads, acc)

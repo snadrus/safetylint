@@ -86,6 +86,14 @@ func inheritHoldFromCallers(fn *ssa.Function, g guardKey, funcs map[*ssa.Functio
 	if fn == nil || fnReleasesGuard(fn, g) {
 		return 0
 	}
+	return inheritHoldRec(fn, g, funcs, heldCache, map[*ssa.Function]bool{})
+}
+
+func inheritHoldRec(fn *ssa.Function, g guardKey, funcs map[*ssa.Function]bool, heldCache map[*ssa.Function]map[ssa.Instruction]holdSet, visiting map[*ssa.Function]bool) holdMode {
+	if fn == nil || visiting[fn] {
+		return 0
+	}
+	visiting[fn] = true
 	var mode holdMode
 	found := false
 	for caller := range funcs {
@@ -113,7 +121,13 @@ func inheritHoldFromCallers(fn *ssa.Function, g guardKey, funcs map[*ssa.Functio
 				}
 				m := holdModeFor(held[instr], g)
 				if m == 0 {
-					return 0
+					if fnReleasesGuard(caller, g) {
+						return 0
+					}
+					m = inheritHoldRec(caller, g, funcs, heldCache, visiting)
+					if m == 0 {
+						return 0
+					}
 				}
 				if !found || m < mode {
 					mode = m
