@@ -457,19 +457,23 @@ func oneWorkerCluster(writers map[*ssa.Function]bool) bool {
 // block cannot reach without traversing a loop back edge. Writes in that
 // position happen-before the goroutine sees the value.
 func instrBeforeGo(instr ssa.Instruction, g *ssa.Go) bool {
-	if instr == nil || g == nil {
+	return instrBeforeInstr(instr, g)
+}
+
+func instrBeforeInstr(instr, at ssa.Instruction) bool {
+	if instr == nil || at == nil {
 		return false
 	}
-	ib, gb := instr.Block(), g.Block()
-	if ib == nil || gb == nil || ib.Parent() != gb.Parent() {
+	ib, ab := instr.Block(), at.Block()
+	if ib == nil || ab == nil || ib.Parent() != ab.Parent() {
 		return false
 	}
-	if ib == gb {
-		return instrIndex(ib, instr) < instrIndex(gb, g)
+	if ib == ab {
+		return instrIndex(ib, instr) < instrIndex(ab, at)
 	}
-	// Forward-reachability from g avoiding back edges (succ dominates pred).
-	seen := map[*ssa.BasicBlock]bool{gb: true}
-	work := []*ssa.BasicBlock{gb}
+	// Forward-reachability from at avoiding back edges (succ dominates pred).
+	seen := map[*ssa.BasicBlock]bool{ab: true}
+	work := []*ssa.BasicBlock{ab}
 	for len(work) > 0 {
 		b := work[len(work)-1]
 		work = work[:len(work)-1]
@@ -478,7 +482,7 @@ func instrBeforeGo(instr ssa.Instruction, g *ssa.Go) bool {
 				continue // back edge: next iteration
 			}
 			if s == ib {
-				return false // instr may run after g in this iteration
+				return false // instr may run after at in this iteration
 			}
 			if !seen[s] {
 				seen[s] = true

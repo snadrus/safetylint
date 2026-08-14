@@ -392,7 +392,10 @@ func goroutineReachableFrom(fn *ssa.Function, pkg *ssa.Package) map[*ssa.Functio
 }
 
 // heapParamAliases maps heap Allocs (and their addresses) that store a copy
-// of a parameter — typical for closure captures of params.
+// of a parameter — typical for closure captures of params. A store that is
+// definitely replaced before every spawn/closure point no longer aliases the
+// param there (EnableChangeDetection storing obj then overwriting the field
+// with a private copy before go).
 func heapParamAliases(fn *ssa.Function) map[ssa.Value]*ssa.Parameter {
 	out := map[ssa.Value]*ssa.Parameter{}
 	if fn == nil {
@@ -408,12 +411,78 @@ func heapParamAliases(fn *ssa.Function) map[ssa.Value]*ssa.Parameter {
 			if !ok {
 				continue
 			}
+			if paramStoreSuperseded(fn, st) {
+				continue
+			}
 			addr := st.Addr
 			out[addr] = p
 			out[stripToObject(addr)] = p
 		}
 	}
 	return out
+}
+
+// paramStoreSuperseded reports that another store replaces the same cell
+// with a non-parameter value before every Go and MakeClosure in fn.
+func paramStoreSuperseded(fn *ssa.Function, st *ssa.Store) bool {
+	var spawnish []ssa.Instruction
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			switch instr.(type) {
+			case *ssa.Go, *ssa.MakeClosure:
+				spawnish = append(spawnish, instr)
+			}
+		}
+	}
+	if len(spawnish) == 0 {
+		return false
+	}
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			st2, ok := instr.(*ssa.Store)
+			if !ok || st2 == st || st2.Val == st.Val {
+				continue
+			}
+			if _, isParam := st2.Val.(*ssa.Parameter); isParam {
+				continue
+			}
+			if !sameCellAddr(st.Addr, st2.Addr) {
+				continue
+			}
+			all := true
+			for _, sp := range spawnish {
+				if !dominatesInstr(st2, sp) {
+					all = false
+					break
+				}
+			}
+			if all {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sameCellAddr matches two addresses that name the same memory cell: the
+// identical SSA value, the same field of the same object, or the same
+// canonical object.
+func sameCellAddr(a, b ssa.Value) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	fa, okA := a.(*ssa.FieldAddr)
+	fb, okB := b.(*ssa.FieldAddr)
+	if okA && okB {
+		return fa.Field == fb.Field && stripToObject(fa.X) == stripToObject(fb.X)
+	}
+	if okA != okB {
+		return false
+	}
+	return stripToObject(a) == stripToObject(b)
 }
 
 func argForSharedParam(c *ssa.CallCommon, cal *ssa.Function, sp SharedParam) ssa.Value {
@@ -510,12 +579,9 @@ func (a *analyzer) checkShareFactCalls(reported map[string]bool) {
 					continue
 				}
 				for _, sp := range fact.Params {
-					// Same-package shares without a tied mutex are already
-					// checked at the go site by checkGo (the goroutine, the
-					// caller's writes, and every sibling access are all in
-					// this package's function set). Only tied-mutex Facts
-					// need call-site enforcement here.
-					if cal.Pkg == a.pkg && !sp.Mutex.set() {
+					// Same-package write shares without a tied mutex are
+					// already refused at the go site by checkGo.
+					if cal.Pkg == a.pkg && sp.Mode == ShareWrite && !sp.Mutex.set() {
 						continue
 					}
 					arg := argForSharedParam(c, cal, sp)

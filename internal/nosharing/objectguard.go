@@ -57,15 +57,68 @@ func spawnerNonConcurrent(acc dataAccess, spawner *ssa.Function, g *ssa.Go) bool
 		return false
 	}
 	if anchor.Parent() != spawner {
-		if acc.via == nil || acc.via.Parent() != spawner {
-			return false
+		if acc.via != nil && acc.via.Parent() == spawner {
+			anchor = acc.via
+		} else {
+			return callerPreSpawn(anchor, acc.via, spawner)
 		}
-		anchor = acc.via
 	}
 	if instrBeforeGo(anchor, g) {
 		return true
 	}
 	return instrAfterJoin(anchor, spawner, g)
+}
+
+// callerPreSpawn reports a constructor-freeze shape: the access happens in a
+// caller F of the spawner, before every call in F that (transitively, via
+// same-package static calls) reaches the spawner. Such writes happen-before
+// the call and therefore before the spawn inside it (TaskEngine field setup
+// in New before startScheduler()).
+func callerPreSpawn(anchor, via ssa.Instruction, spawner *ssa.Function) bool {
+	if anchor == nil || spawner == nil {
+		return false
+	}
+	fn := anchor.Parent()
+	if via != nil && via.Parent() != nil {
+		anchor = via
+		fn = via.Parent()
+	}
+	if fn == nil || fn == spawner {
+		return false
+	}
+	found := false
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			var c *ssa.CallCommon
+			switch in := instr.(type) {
+			case *ssa.Call:
+				c = in.Common()
+			case *ssa.Defer:
+				c = in.Common()
+			case *ssa.Go:
+				// A go in the caller itself: the access must precede it too
+				// (its goroutine may alias the same object).
+				if !instrBeforeInstr(anchor, in) {
+					return false
+				}
+				continue
+			default:
+				continue
+			}
+			cal := staticCallee(c)
+			if cal == nil || len(cal.Blocks) == 0 {
+				continue
+			}
+			if cal != spawner && !callReachable(cal)[spawner] {
+				continue
+			}
+			found = true
+			if !instrBeforeInstr(anchor, instr) {
+				return false
+			}
+		}
+	}
+	return found
 }
 
 // instrAfterJoin reports that instr runs after a wg.Wait() paired with g

@@ -134,6 +134,9 @@ func TestNosharing(t *testing.T) {
 		"good_xpkg_stride",
 		"good_treed_pool",
 		"bad_join_between",
+		"good_ctor_freeze",
+		"bad_ctor_postwrite",
+		"good_share_replaced",
 		"bad_curio_locks",
 		"bad_curio_stride",
 	)
