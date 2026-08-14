@@ -128,6 +128,8 @@ func TestNosharing(t *testing.T) {
 		"promiselib",
 		"good_promise_poll",
 		"bad_safefield_rebind",
+		"good_listener_serve",
+		"good_execwait",
 		"bad_curio_locks",
 		"bad_curio_stride",
 	)

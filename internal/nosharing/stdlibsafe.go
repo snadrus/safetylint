@@ -100,6 +100,19 @@ var stdlibEffects = map[string]stdlibShape{
 	"(*bufio.Reader).Read":  {recv: effectWrite, args: []operandEffect{effectWrite}},
 	"(*bufio.Writer).Write": {recv: effectWrite, args: []operandEffect{effectRead}},
 	"(*bufio.Writer).Flush": {recv: effectWrite},
+
+	// exec.Cmd's documented protocol: one goroutine Waits while others may
+	// Signal/Kill via cmd.Process (os.Process is a ConcurrentSafe anchor).
+	// Wait does mutate internal state, but never fields that the sanctioned
+	// concurrent operations read. (Two concurrent Waits remain an app bug
+	// this table cannot see.)
+	"(*os/exec.Cmd).Wait": {recv: effectRead},
+
+	// go-buffer-pool: Get returns a buffer the caller exclusively owns;
+	// Put only stores the slice header back into the pool (a lease return,
+	// not a concurrent write of the buffer contents).
+	"github.com/libp2p/go-buffer-pool.Get": {args: []operandEffect{effectNone}},
+	"github.com/libp2p/go-buffer-pool.Put": {args: []operandEffect{effectRead}},
 }
 
 // stdlibReadOnly lists bodyless GOROOT helpers that only read map/slice

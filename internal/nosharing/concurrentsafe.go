@@ -14,6 +14,15 @@ import (
 var concurrentSafeAnchors = map[string]map[string]bool{
 	"os": {
 		"File": true,
+		// Process methods (Signal/Kill/Wait) are documented safe for
+		// concurrent use alongside exec.Cmd.Wait.
+		"Process": true,
+	},
+	"net": {
+		// Closing a Listener/Conn from another goroutine is the documented
+		// way to unblock Accept/Read (net.Listener contract).
+		"Listener": true,
+		"Conn":     true,
 	},
 	"net/http": {
 		"Client": true,
