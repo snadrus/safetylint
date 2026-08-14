@@ -239,7 +239,13 @@ func collectDataAccessesDeepPass(pass *analysis.Pass, root ssa.Value, funcs map[
 						continue
 					}
 					calFuncs := reachableFuncs(cal, cal.Pkg)
-					addAll(collectDataAccessesDeepPass(pass, cal.Params[i], calFuncs, visiting))
+					deep := collectDataAccessesDeepPass(pass, cal.Params[i], calFuncs, visiting)
+					for di := range deep {
+						if deep[di].via == nil {
+							deep[di].via = instr
+						}
+					}
+					addAll(deep)
 				}
 			}
 		}
@@ -296,6 +302,10 @@ type dataAccess struct {
 	instr ssa.Instruction
 	addr  ssa.Value // address or map value being accessed
 	write bool
+	// via is the call instruction that pulled this access in during deep
+	// collection (nil for direct accesses). Position-based filters treat
+	// the access as happening at the call site.
+	via ssa.Instruction
 }
 
 // collectDataAccesses finds loads and stores through root (excluding

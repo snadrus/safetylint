@@ -43,6 +43,62 @@ func safeCellType(pass *analysis.Pass, t types.Type) bool {
 	return isConcurrentSafeType(pass, t) || isConcurrentSafeType(pass, pointeeType(t))
 }
 
+// spawnerNonConcurrent reports a spawner-side access that cannot race with
+// the goroutine g: it runs before the go within the iteration (pre-share
+// construction — ReadFull into a leased buffer, conditional header trims),
+// or after this go's WaitGroup join (post-Wait teardown — final hash of the
+// apex buffer). Deep accesses are positioned at their triggering call site.
+func spawnerNonConcurrent(acc dataAccess, spawner *ssa.Function, g *ssa.Go) bool {
+	if spawner == nil || g == nil {
+		return false
+	}
+	anchor := acc.instr
+	if anchor == nil {
+		return false
+	}
+	if anchor.Parent() != spawner {
+		if acc.via == nil || acc.via.Parent() != spawner {
+			return false
+		}
+		anchor = acc.via
+	}
+	if instrBeforeGo(anchor, g) {
+		return true
+	}
+	return instrAfterJoin(anchor, spawner, g)
+}
+
+// instrAfterJoin reports that instr runs after a wg.Wait() paired with g
+// (Add dominating the go; the Wait not preceding the go). Post-Wait code
+// only runs once the counter drains; if the goroutine never calls Done,
+// the Wait blocks and the access never executes — either way it cannot
+// race with g. The go need not dominate the Wait (range-loop spawns may
+// run zero times — then there is nothing to race with).
+func instrAfterJoin(instr ssa.Instruction, spawner *ssa.Function, g *ssa.Go) bool {
+	wg := waitGroupOfGo(spawner, g)
+	if wg == nil {
+		return false
+	}
+	for _, b := range spawner.Blocks {
+		for _, in := range b.Instrs {
+			call, ok := in.(*ssa.Call)
+			if !ok || !isWaitGroupMethod(call.Common(), "Wait") {
+				continue
+			}
+			if stripToObject(recvOfCall(call.Common())) != wg {
+				continue
+			}
+			if dominatesInstr(in, g) {
+				continue // a Wait before the spawn does not join it
+			}
+			if dominatesInstr(in, instr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func concurrentSafeFieldAccess(pass *analysis.Pass, acc dataAccess) bool {
 	if acc.addr == nil {
 		return false
@@ -170,15 +226,16 @@ func objectGuardedRootsAfter(pass *analysis.Pass, roots []sharedRoot, funcs map[
 		}
 		dataRoots = append(dataRoots, root.val)
 		rootVisiting := map[ssa.Value]bool{}
-		rAcc := filterFrozenReads(root.val, collectDataAccessesDeep(root.val, funcs, rootVisiting), funcs)
+		rAcc := filterFrozenReads(root.val, collectDataAccessesDeepPass(pass, root.val, funcs, rootVisiting), funcs)
 		rAcc = dropConcurrentSafeFieldAccesses(pass, rAcc)
 		perRoot[root.val] = rAcc
 		for _, acc := range rAcc {
 			if seenAcc[acc.instr] {
 				continue
 			}
-			// Pre-share construction in the spawner is not a concurrent access.
-			if spawner != nil && g != nil && acc.instr.Parent() == spawner && dominatesInstr(acc.instr, g) {
+			// Pre-share construction and post-join teardown in the spawner
+			// are not concurrent accesses.
+			if spawnerNonConcurrent(acc, spawner, g) {
 				continue
 			}
 			seenAcc[acc.instr] = true
@@ -241,7 +298,7 @@ func objectGuardedRootsAfter(pass *analysis.Pass, roots []sharedRoot, funcs map[
 	if len(dataRoots) > 0 && stridePartitionOK(dataRoots[0], accesses) {
 		return true
 	}
-	if len(dataRoots) > 0 && leaseExclusiveOKAt(dataRoots[0], accesses, funcs, spawner) {
+	if len(dataRoots) > 0 && leaseExclusiveOKAt(dataRoots[0], accesses, funcs, spawner, g) {
 		return true
 	}
 	if len(dataRoots) > 0 && rolePartitionOKAt(dataRoots[0], accesses, funcs, g) {
@@ -255,7 +312,7 @@ func objectGuardedRootsAfter(pass *analysis.Pass, roots []sharedRoot, funcs map[
 		if spawner != nil && g != nil {
 			var live []dataAccess
 			for _, acc := range rAcc {
-				if acc.instr.Parent() == spawner && dominatesInstr(acc.instr, g) {
+				if spawnerNonConcurrent(acc, spawner, g) {
 					continue
 				}
 				live = append(live, acc)
@@ -289,7 +346,7 @@ func objectGuardedRootsAfter(pass *analysis.Pass, roots []sharedRoot, funcs map[
 		if stridePartitionOK(r, rAcc) {
 			continue
 		}
-		if leaseExclusiveOKAt(r, rAcc, funcs, spawner) {
+		if leaseExclusiveOKAt(r, rAcc, funcs, spawner, g) {
 			continue
 		}
 		if rolePartitionOKAt(r, rAcc, funcs, g) {

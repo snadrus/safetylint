@@ -11,17 +11,17 @@ import (
 // exclusive lease: a channel token index into a buffer, or a value popped
 // from a mutex-protected pool and pushed back under the same mutex.
 func leaseExclusiveOK(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Function]bool) bool {
-	return leaseExclusiveOKAt(root, accesses, funcs, nil)
+	return leaseExclusiveOKAt(root, accesses, funcs, nil, nil)
 }
 
-func leaseExclusiveOKAt(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Function]bool, spawner *ssa.Function) bool {
+func leaseExclusiveOKAt(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Function]bool, spawner *ssa.Function, g *ssa.Go) bool {
 	if root == nil || len(accesses) == 0 {
 		return false
 	}
 	if channelTokenLeaseOK(root, accesses, funcs) {
 		return true
 	}
-	if poolHandoffOK(root, accesses, funcs) {
+	if poolHandoffOK(root, accesses, funcs, spawner, g) {
 		return true
 	}
 	return fieldTokenLeaseOK(root, accesses, funcs, spawner)
@@ -375,7 +375,7 @@ func tokenSlotAccesses(group []dataAccess, spawner *ssa.Function) []dataAccess {
 	return out
 }
 
-func poolHandoffOK(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Function]bool) bool {
+func poolHandoffOK(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Function]bool, spawner *ssa.Function, g *ssa.Go) bool {
 	// A value removed from a shared container under a mutex and re-added
 	// under the same mutex is exclusively owned in between. Element writes
 	// may occur in exactly one immediate worker function; the hand-off
@@ -394,6 +394,12 @@ func poolHandoffOK(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Functio
 		}
 		if isSliceHeaderStore(acc) || isAppendOf(acc, root) || isAppendUsing(acc, root) {
 			handoff = append(handoff, acc)
+			continue
+		}
+		// The spawner holds the lease from pop to go: its writes that cannot
+		// run after the go within one iteration (ReadFull into the leased
+		// buffer, conditional header trims) are exclusive, not concurrent.
+		if spawner != nil && g != nil && acc.instr.Parent() == spawner && instrBeforeGo(acc.instr, g) {
 			continue
 		}
 		elemWrites = append(elemWrites, acc)
@@ -444,6 +450,43 @@ func oneWorkerCluster(writers map[*ssa.Function]bool) bool {
 		}
 	}
 	return false
+}
+
+// instrBeforeGo reports that instr cannot execute after g within the same
+// loop iteration: same block with a smaller index, or a block that g's
+// block cannot reach without traversing a loop back edge. Writes in that
+// position happen-before the goroutine sees the value.
+func instrBeforeGo(instr ssa.Instruction, g *ssa.Go) bool {
+	if instr == nil || g == nil {
+		return false
+	}
+	ib, gb := instr.Block(), g.Block()
+	if ib == nil || gb == nil || ib.Parent() != gb.Parent() {
+		return false
+	}
+	if ib == gb {
+		return instrIndex(ib, instr) < instrIndex(gb, g)
+	}
+	// Forward-reachability from g avoiding back edges (succ dominates pred).
+	seen := map[*ssa.BasicBlock]bool{gb: true}
+	work := []*ssa.BasicBlock{gb}
+	for len(work) > 0 {
+		b := work[len(work)-1]
+		work = work[:len(work)-1]
+		for _, s := range b.Succs {
+			if s.Dominates(b) {
+				continue // back edge: next iteration
+			}
+			if s == ib {
+				return false // instr may run after g in this iteration
+			}
+			if !seen[s] {
+				seen[s] = true
+				work = append(work, s)
+			}
+		}
+	}
+	return true
 }
 
 // callReachable is same-package Call/Defer closure (not Go / MakeClosure).

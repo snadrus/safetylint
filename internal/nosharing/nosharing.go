@@ -125,7 +125,7 @@ func run(pass *analysis.Pass) (any, error) {
 		localConcurrentSafe: map[*types.TypeName]bool{},
 	}
 	if packageInModuleCache(pass) {
-		a.exportParamWriteFacts()
+		a.exportParamWriteFacts(false)
 		return nil, nil
 	}
 	a.run()
@@ -215,6 +215,11 @@ func (a *analyzer) run() {
 		a.exportInitOnlyFacts()
 		a.exportHotGlobals()
 		a.exportConcurrentSafeFacts()
+		// WritesParams lets importers classify calls to this package's
+		// bodyless-at-their-analysis-time functions precisely; partial
+		// writers only (fr32.Pad-style src/dest helpers) — the pessimistic
+		// caller default already covers full writers.
+		a.exportParamWriteFacts(true)
 	}
 	a.checkShareFactCalls(reported)
 	a.checkAsyncCallbackShares(reported)

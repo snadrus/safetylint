@@ -130,6 +130,10 @@ func TestNosharing(t *testing.T) {
 		"bad_safefield_rebind",
 		"good_listener_serve",
 		"good_execwait",
+		"padlib",
+		"good_xpkg_stride",
+		"good_treed_pool",
+		"bad_join_between",
 		"bad_curio_locks",
 		"bad_curio_stride",
 	)
