@@ -82,6 +82,7 @@ func run(pass *analysis.Pass) (any, error) {
 	for _, f := range userFiles {
 		filename := pass.Fset.Position(f.Pos()).Filename
 		cgoSource := fileContainsImportC(filename)
+		generated := ast.IsGenerated(f)
 		checkDirectives(pass, f)
 		for _, imp := range f.Imports {
 			path, err := strconv.Unquote(imp.Path.Value)
@@ -93,6 +94,11 @@ func run(pass *analysis.Pass) (any, error) {
 				// cgo rewrites import "C" files to also pull in unsafe; the
 				// package-level cgo diagnostic already covers that.
 				if cgoSource {
+					continue
+				}
+				// Generated code (protobuf) imports unsafe through
+				// protoimpl; the author cannot act on it.
+				if generated {
 					continue
 				}
 				pass.Reportf(imp.Pos(), `import "unsafe" is not verified. Check its safety and the adapter's safety yourself`)
