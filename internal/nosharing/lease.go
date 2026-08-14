@@ -2,6 +2,7 @@ package nosharing
 
 import (
 	"go/token"
+	"go/types"
 
 	"golang.org/x/tools/go/ssa"
 )
@@ -10,13 +11,20 @@ import (
 // exclusive lease: a channel token index into a buffer, or a value popped
 // from a mutex-protected pool and pushed back under the same mutex.
 func leaseExclusiveOK(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Function]bool) bool {
+	return leaseExclusiveOKAt(root, accesses, funcs, nil)
+}
+
+func leaseExclusiveOKAt(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Function]bool, spawner *ssa.Function) bool {
 	if root == nil || len(accesses) == 0 {
 		return false
 	}
 	if channelTokenLeaseOK(root, accesses, funcs) {
 		return true
 	}
-	return poolHandoffOK(root, accesses, funcs)
+	if poolHandoffOK(root, accesses, funcs) {
+		return true
+	}
+	return fieldTokenLeaseOK(root, accesses, funcs, spawner)
 }
 
 func channelTokenLeaseOK(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Function]bool) bool {
@@ -42,11 +50,14 @@ func channelTokenLeaseOK(root ssa.Value, accesses []dataAccess, funcs map[*ssa.F
 			return false
 		}
 		idx := ia.Index
-		if !isChanRecv(idx) && !isExtractOfChanRecv(idx) {
+		if !isTokenIndex(idx) {
 			return false
 		}
 		fn := acc.instr.Parent()
-		if fn == nil || !sendsIndexBack(fn, idx) {
+		if fn == nil {
+			return false
+		}
+		if !sendsIndexBack(fn, idx) && !tokenReturnedAnywhere(idx, funcs) {
 			return false
 		}
 		if writeAfterSendBack(fn, acc.instr, idx) {
@@ -82,16 +93,24 @@ func indexAddrOf(acc dataAccess) (*ssa.IndexAddr, bool) {
 }
 
 func peelIndexAddr(v ssa.Value) (*ssa.IndexAddr, bool) {
+	var found *ssa.IndexAddr
 	for v != nil {
 		switch x := v.(type) {
 		case *ssa.IndexAddr:
-			return x, true
+			// Keep walking toward the object so tbufs[idx][0] yields idx,
+			// the leased slot, not the inner element index.
+			found = x
+			v = x.X
+			continue
 		case *ssa.Slice:
 			v = x.X
 		case *ssa.UnOp:
 			if x.Op == token.MUL {
 				v = x.X
 				continue
+			}
+			if found != nil {
+				return found, true
 			}
 			return nil, false
 		case *ssa.FieldAddr:
@@ -103,10 +122,13 @@ func peelIndexAddr(v ssa.Value) (*ssa.IndexAddr, bool) {
 			}
 			v = v.(*ssa.Convert).X
 		default:
+			if found != nil {
+				return found, true
+			}
 			return nil, false
 		}
 	}
-	return nil, false
+	return found, found != nil
 }
 
 func isChanRecv(v ssa.Value) bool {
@@ -120,6 +142,65 @@ func isExtractOfChanRecv(v ssa.Value) bool {
 		return false
 	}
 	return isChanRecv(ex.Tuple)
+}
+
+// isTokenIndex reports a channel-received integer, including a FreeVar
+// bound to that receive (parent `idx := <-ch` captured by the worker).
+func isTokenIndex(v ssa.Value) bool {
+	seen := map[ssa.Value]bool{}
+	for i := 0; i < 8 && v != nil && !seen[v]; i++ {
+		seen[v] = true
+		if isChanRecv(v) || isExtractOfChanRecv(v) {
+			return true
+		}
+		if stored := storedChanRecv(v); stored != nil {
+			v = stored
+			continue
+		}
+		if u, ok := v.(*ssa.UnOp); ok && u.Op == token.MUL {
+			v = u.X
+			continue
+		}
+		next := resolveCapture(v)
+		if next == nil || next == v {
+			break
+		}
+		v = next
+	}
+	return false
+}
+
+// storedChanRecv reports the channel receive stored into a local int cell
+// (`idx := <-ch` lowered as `t = new int; *t = <-ch`).
+func storedChanRecv(v ssa.Value) ssa.Value {
+	if v == nil {
+		return nil
+	}
+	if u, ok := v.(*ssa.UnOp); ok && u.Op == token.MUL {
+		v = u.X
+	}
+	cell := stripToObject(v)
+	if fv, ok := cell.(*ssa.FreeVar); ok {
+		cell = resolveCapture(fv)
+	}
+	al, ok := cell.(*ssa.Alloc)
+	if !ok {
+		return nil
+	}
+	refs := al.Referrers()
+	if refs == nil {
+		return nil
+	}
+	for _, ref := range *refs {
+		st, ok := ref.(*ssa.Store)
+		if !ok || stripToObject(st.Addr) != al {
+			continue
+		}
+		if isChanRecv(st.Val) || isExtractOfChanRecv(st.Val) {
+			return st.Val
+		}
+	}
+	return nil
 }
 
 func sendsIndexBack(fn *ssa.Function, idx ssa.Value) bool {
@@ -138,7 +219,7 @@ func sendsIndexBack(fn *ssa.Function, idx ssa.Value) bool {
 				if !ok {
 					continue
 				}
-				if s.X == idx || stripToObject(s.X) == stripToObject(idx) {
+				if tokenValueMatches(s.X, idx) {
 					found = true
 					return
 				}
@@ -162,7 +243,7 @@ func writeAfterSendBack(fn *ssa.Function, write ssa.Instruction, idx ssa.Value) 
 			if !ok {
 				continue
 			}
-			if s.X != idx && stripToObject(s.X) != stripToObject(idx) {
+			if !tokenValueMatches(s.X, idx) {
 				continue
 			}
 			if dominatesInstr(s, write) {
@@ -171,6 +252,127 @@ func writeAfterSendBack(fn *ssa.Function, write ssa.Instruction, idx ssa.Value) 
 		}
 	}
 	return false
+}
+
+func tokenReturnedAnywhere(idx ssa.Value, funcs map[*ssa.Function]bool) bool {
+	for fn := range funcs {
+		if sendsIndexBack(fn, idx) {
+			return true
+		}
+	}
+	return false
+}
+
+func tokenValueMatches(v, idx ssa.Value) bool {
+	if v == nil || idx == nil {
+		return false
+	}
+	if v == idx || stripToObject(v) == stripToObject(idx) {
+		return true
+	}
+	a, b := tokenCell(v), tokenCell(idx)
+	return a != nil && b != nil && a == b
+}
+
+// tokenCell peels loads and closure FreeVars down to the stack cell that
+// holds a channel-received index (`new int` / captured *int).
+func tokenCell(v ssa.Value) ssa.Value {
+	seen := map[ssa.Value]bool{}
+	for i := 0; i < 8 && v != nil && !seen[v]; i++ {
+		seen[v] = true
+		if u, ok := v.(*ssa.UnOp); ok && u.Op == token.MUL {
+			v = u.X
+			continue
+		}
+		if fv, ok := v.(*ssa.FreeVar); ok {
+			next := resolveCapture(fv)
+			if next == nil || next == v {
+				return v
+			}
+			v = next
+			continue
+		}
+		return stripToObject(v)
+	}
+	return stripToObject(v)
+}
+
+// fieldTokenLeaseOK accepts a struct whose fields are either channels,
+// token-leased slots, atomics, or written only by the spawning function
+// (parent-exclusive state concurrent with a leased-field worker).
+func fieldTokenLeaseOK(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Function]bool, spawner *ssa.Function) bool {
+	if root == nil || namedStructOf(root.Type()) == nil || len(accesses) == 0 {
+		return false
+	}
+	byField := map[int][]dataAccess{}
+	for _, acc := range accesses {
+		if acc.addr != nil && isChanType(acc.addr.Type()) {
+			continue
+		}
+		if isSliceHeaderLoad(acc) {
+			continue
+		}
+		fi := accessFieldIndex(root, acc)
+		if fi < 0 {
+			// Pointer-cell load/store of *T / **T is not a field of T.
+			if !acc.write || isObjectInitStore(acc) {
+				continue
+			}
+			return false
+		}
+		byField[fi] = append(byField[fi], acc)
+	}
+	if len(byField) == 0 {
+		return false
+	}
+	sawLease := false
+	for _, group := range byField {
+		if channelTokenLeaseOK(root, tokenSlotAccesses(group, spawner), funcs) {
+			sawLease = true
+			continue
+		}
+		if atomicsOnlyAccesses(group) {
+			continue
+		}
+		if spawner == nil {
+			return false
+		}
+		reach := callReachable(spawner)
+		for _, acc := range group {
+			fn := acc.instr.Parent()
+			if fn == nil {
+				return false
+			}
+			if fn != spawner && !reach[fn] {
+				return false
+			}
+		}
+	}
+	return sawLease
+}
+
+// tokenSlotAccesses drops slice-header setup in the spawner so a one-time
+// `tbufs = make(...)` does not poison slot-index token matching.
+func tokenSlotAccesses(group []dataAccess, spawner *ssa.Function) []dataAccess {
+	var out []dataAccess
+	reach := map[*ssa.Function]bool{}
+	if spawner != nil {
+		reach = callReachable(spawner)
+		reach[spawner] = true
+	}
+	for _, acc := range group {
+		if isSliceHeaderLoad(acc) {
+			continue
+		}
+		if isSliceHeaderStore(acc) {
+			fn := acc.instr.Parent()
+			if fn != nil && (fn == spawner || reach[fn]) {
+				continue
+			}
+		}
+		out = append(out, acc)
+	}
+	return out
 }
 
 func poolHandoffOK(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Function]bool) bool {
@@ -190,11 +392,14 @@ func poolHandoffOK(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Functio
 		if !acc.write {
 			continue
 		}
-		if isSliceHeaderStore(acc) || isAppendOf(acc, root) {
+		if isSliceHeaderStore(acc) || isAppendOf(acc, root) || isAppendUsing(acc, root) {
 			handoff = append(handoff, acc)
 			continue
 		}
 		elemWrites = append(elemWrites, acc)
+	}
+	if len(handoff) == 0 {
+		handoff = appendHandoffs(root, funcs)
 	}
 	if len(elemWrites) == 0 || len(handoff) == 0 {
 		return false
@@ -273,15 +478,97 @@ func callReachable(start *ssa.Function) map[*ssa.Function]bool {
 	return seen
 }
 
+func isAppendUsing(acc dataAccess, root ssa.Value) bool {
+	return isAppendOf(acc, root)
+}
+
+func appendHandoffs(root ssa.Value, funcs map[*ssa.Function]bool) []dataAccess {
+	if root == nil {
+		return nil
+	}
+	derived := deriveAddrs(root, funcs)
+	var out []dataAccess
+	for fn := range funcs {
+		if fn == nil {
+			continue
+		}
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				c, ok := instr.(*ssa.Call)
+				if !ok || c.Common() == nil || !isBuiltin(c.Common(), "append") {
+					continue
+				}
+				if appendMentionsRoot(c, root, derived) {
+					out = append(out, dataAccess{instr: c, addr: root, write: true})
+				}
+			}
+		}
+	}
+	return out
+}
+
 func isAppendOf(acc dataAccess, root ssa.Value) bool {
 	c, ok := acc.instr.(*ssa.Call)
 	if !ok || c.Common() == nil || !isBuiltin(c.Common(), "append") {
 		return false
 	}
+	return appendMentionsRoot(c, root, nil)
+}
+
+func appendMentionsRoot(c *ssa.Call, root ssa.Value, derived map[ssa.Value]bool) bool {
+	if c == nil || c.Common() == nil || root == nil {
+		return false
+	}
 	for _, arg := range c.Common().Args {
-		if arg == root || stripToObject(arg) == stripToObject(root) {
+		if derived[arg] || arg == root || stripToObject(arg) == stripToObject(root) || aliasesRoot(arg, root) {
+			return true
+		}
+		if sl, ok := arg.(*ssa.Slice); ok && varargsPackedFrom(sl, root, derived) {
 			return true
 		}
 	}
 	return false
+}
+
+// varargsPackedFrom reports SSA `append(pool, x)` lowered as
+// `t = new [1]T (varargs); t[0] = x; append(pool, t[:]...)`.
+func varargsPackedFrom(sl *ssa.Slice, root ssa.Value, derived map[ssa.Value]bool) bool {
+	if sl == nil || sl.X == nil || root == nil {
+		return false
+	}
+	refs := sl.X.Referrers()
+	if refs == nil {
+		return false
+	}
+	for _, ref := range *refs {
+		ia, ok := ref.(*ssa.IndexAddr)
+		if !ok || ia.X != sl.X {
+			continue
+		}
+		iaRefs := ia.Referrers()
+		if iaRefs == nil {
+			continue
+		}
+		for _, r2 := range *iaRefs {
+			st, ok := r2.(*ssa.Store)
+			if !ok || st.Addr != ia {
+				continue
+			}
+			if derived[st.Val] || aliasesRoot(st.Val, root) || stripToObject(st.Val) == stripToObject(root) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// namedStructOf peels pointers (*T / **T capture cells) down to a struct.
+func namedStructOf(t types.Type) *types.Struct {
+	for i := 0; i < 4 && t != nil; i++ {
+		if st := structOf(t); st != nil {
+			return st
+		}
+		t = pointeeType(t)
+	}
+	return nil
 }

@@ -3,6 +3,7 @@ package nosharing
 import (
 	"go/constant"
 	"go/token"
+	"go/types"
 
 	"golang.org/x/tools/go/ssa"
 )
@@ -32,6 +33,7 @@ func stridePartitionOK(root ssa.Value, accesses []dataAccess) bool {
 		}
 	}
 	var writes []dataAccess
+	var reads []dataAccess
 	for _, acc := range accesses {
 		if isSliceHeaderLoad(acc) {
 			continue
@@ -40,7 +42,8 @@ func stridePartitionOK(root ssa.Value, accesses []dataAccess) bool {
 			return false
 		}
 		if !acc.write {
-			return false
+			reads = append(reads, acc)
+			continue
 		}
 		writes = append(writes, acc)
 	}
@@ -55,28 +58,133 @@ func stridePartitionOK(root ssa.Value, accesses []dataAccess) bool {
 		}
 		writers[fn] = true
 	}
-	if len(writers) != 1 {
+	if !oneWorkerCluster(writers) {
 		return false
 	}
-	var worker *ssa.Function
-	for fn := range writers {
-		worker = fn
+	worker := findStrideWorker(writers)
+	if worker == nil {
+		return false
 	}
+	reach := callReachable(worker)
 	start, end, ok := strideBoundsOf(worker, writes)
 	if !ok {
 		return false
 	}
+	needTile := false
 	for _, acc := range writes {
-		if !writeInStride(acc, start, end) {
-			return false
+		if writeInStride(acc, start, end) {
+			continue
 		}
+		// Same-package helper (e.g. pad/copy) may write a sub-slice that
+		// the worker passed as an in-stride tile — not the whole root.
+		if acc.instr.Parent() != worker && reach[acc.instr.Parent()] {
+			needTile = true
+			continue
+		}
+		return false
+	}
+	if needTile && !workerPassesOnlyStrideTiles(worker, root, start, end) {
+		return false
+	}
+	for _, acc := range reads {
+		if writeInStride(acc, start, end) {
+			continue
+		}
+		if acc.instr.Parent() != worker && reach[acc.instr.Parent()] {
+			continue
+		}
+		return false
 	}
 	return strideSpawnsDisjoint(worker, start, end)
+}
+
+// findStrideWorker prefers the Go callee that call-reaches every writer
+// (the spawning closure), not a leaf helper such as pad/copy.
+func findStrideWorker(writers map[*ssa.Function]bool) *ssa.Function {
+	seen := map[*ssa.Function]bool{}
+	var worker *ssa.Function
+	var consider func(*ssa.Function)
+	consider = func(fn *ssa.Function) {
+		if fn == nil || seen[fn] {
+			return
+		}
+		seen[fn] = true
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				g, ok := instr.(*ssa.Go)
+				if !ok || g.Common() == nil {
+					continue
+				}
+				cal := staticCallee(g.Common())
+				if cal == nil {
+					if mc, ok := g.Common().Value.(*ssa.MakeClosure); ok {
+						cal, _ = mc.Fn.(*ssa.Function)
+					}
+				}
+				if cal == nil {
+					continue
+				}
+				reach := callReachable(cal)
+				covers := true
+				for w := range writers {
+					if w != cal && !reach[w] {
+						covers = false
+						break
+					}
+				}
+				if covers {
+					worker = cal
+				}
+			}
+		}
+		for _, anon := range fn.AnonFuncs {
+			consider(anon)
+		}
+		if fn.Parent() != nil {
+			consider(fn.Parent())
+		}
+		if fn.Pkg != nil {
+			walkPkgFuncs(fn.Pkg, consider)
+		}
+	}
+	for w := range writers {
+		consider(w)
+		if w != nil && w.Parent() != nil {
+			consider(w.Parent())
+		}
+	}
+	if worker != nil {
+		return worker
+	}
+	return clusterRoot(writers)
+}
+
+func clusterRoot(writers map[*ssa.Function]bool) *ssa.Function {
+	for w := range writers {
+		if w == nil {
+			continue
+		}
+		reach := callReachable(w)
+		ok := true
+		for o := range writers {
+			if o != w && !reach[o] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return w
+		}
+	}
+	return nil
 }
 
 func strideBoundsOf(fn *ssa.Function, writes []dataAccess) (start, end ssa.Value, ok bool) {
 	if fn == nil {
 		return nil, nil, false
+	}
+	if s, e, ok := paramLoopBounds(fn); ok {
+		return s, e, true
 	}
 	// Prefer parameters named by the loop `for i := start; i < end; i++`.
 	for _, acc := range writes {
@@ -94,6 +202,59 @@ func strideBoundsOf(fn *ssa.Function, writes []dataAccess) (start, end ssa.Value
 		return asBoundVar(s), asBoundVar(e), true
 	}
 	return nil, nil, false
+}
+
+// paramLoopBounds reports start/end when fn is `func(start, end int)` (or
+// extra leading params) and contains `for i := start; i < end; i++`.
+func paramLoopBounds(fn *ssa.Function) (start, end ssa.Value, ok bool) {
+	if fn == nil {
+		return nil, nil, false
+	}
+	var ints []ssa.Value
+	for _, p := range fn.Params {
+		if isIntValue(p) {
+			ints = append(ints, p)
+		}
+	}
+	if len(ints) < 2 {
+		return nil, nil, false
+	}
+	start, end = ints[len(ints)-2], ints[len(ints)-1]
+	if !fnLoopsStartEnd(fn, start, end) {
+		return nil, nil, false
+	}
+	return start, end, true
+}
+
+func isIntValue(v ssa.Value) bool {
+	if v == nil {
+		return false
+	}
+	t := types.Unalias(v.Type())
+	b, ok := t.(*types.Basic)
+	return ok && b.Info()&types.IsInteger != 0
+}
+
+func fnLoopsStartEnd(fn *ssa.Function, start, end ssa.Value) bool {
+	if fn == nil || start == nil || end == nil {
+		return false
+	}
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			phi, ok := instr.(*ssa.Phi)
+			if !ok {
+				continue
+			}
+			s, e, ok := loopBoundsOfIndex(phi)
+			if !ok {
+				continue
+			}
+			if asBoundVar(s) == start && asBoundVar(e) == end {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func asBoundVar(v ssa.Value) ssa.Value {
@@ -249,6 +410,19 @@ func loopEndComparedTo(idx ssa.Value) ssa.Value {
 }
 
 func writeInStride(acc dataAccess, start, end ssa.Value) bool {
+	if sl, ok := sliceOf(acc); ok && sliceInStride(sl, start, end) {
+		return true
+	}
+	if ia, ok := indexAddrOf(acc); ok {
+		if sl, ok := ia.X.(*ssa.Slice); ok && sliceInStride(sl, start, end) {
+			return true
+		}
+		if u, ok := ia.X.(*ssa.UnOp); ok && u.Op == token.MUL {
+			if sl, ok := u.X.(*ssa.Slice); ok && sliceInStride(sl, start, end) {
+				return true
+			}
+		}
+	}
 	idx, ok := indexOfWrite(acc)
 	if !ok {
 		return false
@@ -258,6 +432,80 @@ func writeInStride(acc dataAccess, start, end ssa.Value) bool {
 		return false
 	}
 	return asBoundVar(s) == start && asBoundVar(e) == end
+}
+
+func sliceInStride(sl *ssa.Slice, start, end ssa.Value) bool {
+	if sl == nil || sl.Low == nil || sl.High == nil {
+		return false
+	}
+	i := peelAffineIndex(sl.Low)
+	if peelAffineIndex(sl.High) != i {
+		return false
+	}
+	s, e, ok := loopBoundsOfIndex(i)
+	if !ok {
+		return false
+	}
+	return asBoundVar(s) == start && asBoundVar(e) == end
+}
+
+// workerPassesOnlyStrideTiles reports that every Call/Defer in the worker
+// that forwards a root-derived value passes an in-stride sub-slice, so a
+// callee that writes its whole parameter still only touches one tile.
+func workerPassesOnlyStrideTiles(worker *ssa.Function, root, start, end ssa.Value) bool {
+	if worker == nil || root == nil {
+		return false
+	}
+	reach := callReachable(worker)
+	derived := deriveAddrs(root, reach)
+	for fn := range reach {
+		if fn == nil {
+			continue
+		}
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				var c *ssa.CallCommon
+				switch in := instr.(type) {
+				case *ssa.Call:
+					c = in.Common()
+				case *ssa.Defer:
+					c = in.Common()
+				default:
+					continue
+				}
+				if c == nil {
+					continue
+				}
+				if b, ok := c.Value.(*ssa.Builtin); ok && (b.Name() == "len" || b.Name() == "cap") {
+					continue
+				}
+				for _, arg := range c.Args {
+					if !derived[arg] && !aliasesRoot(arg, root) {
+						continue
+					}
+					if !valueIsStrideTile(arg, start, end) {
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
+func valueIsStrideTile(v, start, end ssa.Value) bool {
+	if v == nil {
+		return false
+	}
+	if sl, ok := v.(*ssa.Slice); ok {
+		return sliceInStride(sl, start, end)
+	}
+	if u, ok := v.(*ssa.UnOp); ok && u.Op == token.MUL {
+		if sl, ok := u.X.(*ssa.Slice); ok {
+			return sliceInStride(sl, start, end)
+		}
+	}
+	return false
 }
 
 func strideSpawnsDisjoint(worker *ssa.Function, start, end ssa.Value) bool {

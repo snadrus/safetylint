@@ -198,12 +198,25 @@ func (a *analyzer) typeIsConcurrentSafe(tn *types.TypeName, methods []*ssa.Funct
 		if recv0 == nil {
 			recv0 = recv
 		}
-		for _, acc := range collectDataAccessesDeep(recv, funcs, map[ssa.Value]bool{}) {
+		visiting := map[ssa.Value]bool{}
+		for _, acc := range collectDataAccessesDeep(recv, funcs, visiting) {
 			if seen[acc.instr] {
 				continue
 			}
 			seen[acc.instr] = true
 			accesses = append(accesses, acc)
+		}
+		// Heap-escaped receivers (*t = recv) hide field writes from the
+		// Parameter; collect the **T cell so ConcurrentSafe is not derived
+		// from an empty access list.
+		for _, cell := range escapeAliasCells(recv, funcs) {
+			for _, acc := range collectDataAccessesDeep(cell, funcs, visiting) {
+				if seen[acc.instr] {
+					continue
+				}
+				seen[acc.instr] = true
+				accesses = append(accesses, acc)
+			}
 		}
 	}
 	accesses = filterFrozenReads(recv0, accesses, funcs)

@@ -50,8 +50,11 @@ func consistentMutexGuards(accesses []dataAccess, funcs map[*ssa.Function]bool) 
 			held := heldCache[fn]
 			mode := holdModeFor(held[acc.instr], g)
 			if !modeOKForAccess(mode, acc.write, rw) {
-				ok = false
-				break
+				mode = inheritHoldFromCallers(fn, g, funcs, heldCache)
+				if !modeOKForAccess(mode, acc.write, rw) {
+					ok = false
+					break
+				}
 			}
 		}
 		if ok {
@@ -74,6 +77,81 @@ func sameGuard(a, b guardKey) bool {
 	}
 	ra, rb := resolveGuardBase(a.base), resolveGuardBase(b.base)
 	return ra != nil && rb != nil && ra == rb
+}
+
+// inheritHoldFromCallers reports a must-hold inherited from every same-package
+// call site when fn itself never releases that guard (caller-held lock across
+// a helper such as slk.unlock()).
+func inheritHoldFromCallers(fn *ssa.Function, g guardKey, funcs map[*ssa.Function]bool, heldCache map[*ssa.Function]map[ssa.Instruction]holdSet) holdMode {
+	if fn == nil || fnReleasesGuard(fn, g) {
+		return 0
+	}
+	var mode holdMode
+	found := false
+	for caller := range funcs {
+		if caller == nil || caller == fn {
+			continue
+		}
+		held, ok := heldCache[caller]
+		if !ok {
+			held = analyzeMustHold(caller)
+			heldCache[caller] = held
+		}
+		for _, b := range caller.Blocks {
+			for _, instr := range b.Instrs {
+				var c *ssa.CallCommon
+				switch in := instr.(type) {
+				case *ssa.Call:
+					c = in.Common()
+				case *ssa.Defer:
+					c = in.Common()
+				default:
+					continue
+				}
+				if c == nil || c.StaticCallee() != fn {
+					continue
+				}
+				m := holdModeFor(held[instr], g)
+				if m == 0 {
+					return 0
+				}
+				if !found || m < mode {
+					mode = m
+				}
+				found = true
+			}
+		}
+	}
+	if !found {
+		return 0
+	}
+	return mode
+}
+
+func fnReleasesGuard(fn *ssa.Function, g guardKey) bool {
+	if fn == nil {
+		return true
+	}
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			call, ok := instr.(*ssa.Call)
+			if !ok || call.Common() == nil {
+				continue
+			}
+			gk, ok := lockUnlockGuard(call.Common())
+			if !ok {
+				continue
+			}
+			name := mutexMethodName(call.Common())
+			if name != "Unlock" && name != "RUnlock" {
+				continue
+			}
+			if sameGuard(gk, g) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func holdModeFor(held holdSet, g guardKey) holdMode {
@@ -120,26 +198,54 @@ func fieldMutexGuards(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Func
 }
 
 func accessFieldIndex(root ssa.Value, acc dataAccess) int {
-	cur := acc.addr
+	if i := fieldIndexFrom(root, acc.addr); i >= 0 {
+		return i
+	}
+	if st, ok := acc.instr.(*ssa.Store); ok {
+		if i := fieldIndexFrom(root, st.Addr); i >= 0 {
+			return i
+		}
+	}
+	if c, ok := acc.instr.(*ssa.Call); ok && c.Common() != nil {
+		for _, arg := range c.Common().Args {
+			if i := fieldIndexFrom(root, arg); i >= 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func fieldIndexFrom(root, cur ssa.Value) int {
 	rootObj := stripToObject(root)
-	rootSt := structOf(root.Type())
+	rootSt := namedStructOf(root.Type())
 	for cur != nil {
-		if fa, ok := cur.(*ssa.FieldAddr); ok {
-			if stripToObject(fa.X) == rootObj || fa.X == root {
-				return fa.Field
+		switch x := cur.(type) {
+		case *ssa.FieldAddr:
+			if stripToObject(x.X) == rootObj || x.X == root {
+				return x.Field
 			}
 			// Same named/struct type as root (method receiver vs Alloc).
-			if rootSt != nil && structOf(fa.X.Type()) != nil && structOf(fa.X.Type()).String() == rootSt.String() {
-				return fa.Field
+			if rootSt != nil && structOf(x.X.Type()) != nil && structOf(x.X.Type()).String() == rootSt.String() {
+				return x.Field
 			}
-			cur = fa.X
-			continue
+			cur = x.X
+		case *ssa.UnOp:
+			if x.Op != token.MUL {
+				return -1
+			}
+			cur = x.X
+		case *ssa.IndexAddr:
+			cur = x.X
+		case *ssa.Slice:
+			cur = x.X
+		case *ssa.ChangeType:
+			cur = x.X
+		case *ssa.Convert:
+			cur = x.X
+		default:
+			return -1
 		}
-		if u, ok := cur.(*ssa.UnOp); ok && u.Op == token.MUL {
-			cur = u.X
-			continue
-		}
-		break
 	}
 	return -1
 }

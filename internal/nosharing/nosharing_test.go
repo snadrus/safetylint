@@ -115,5 +115,12 @@ func TestNosharing(t *testing.T) {
 		"good_ws_roles",
 		"bad_ws_tworeaders",
 		"bad_looplocal_hoist",
+		"good_curio_stride",
+		"good_curio_lease",
+		"good_curio_token",
+		"good_curio_locks",
+		"good_curio_ws",
+		"bad_curio_locks",
+		"bad_curio_stride",
 	)
 }

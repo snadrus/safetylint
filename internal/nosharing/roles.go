@@ -85,9 +85,19 @@ func derefType(t types.Type) types.Type {
 // access is inside a listed role method (or Close) and at most one concurrent
 // goroutine uses each role on this object.
 func rolePartitionOK(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Function]bool) bool {
+	return rolePartitionOKAt(root, accesses, funcs, nil)
+}
+
+func rolePartitionOKAt(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Function]bool, at *ssa.Go) bool {
 	c := roleContractFor(root.Type())
 	if c == nil || len(accesses) == 0 {
 		return false
+	}
+	object := root
+	if at != nil {
+		if bound := bindRootAtGo(at, root); bound != nil {
+			object = bound
+		}
 	}
 	var live []dataAccess
 	for _, acc := range accesses {
@@ -114,7 +124,7 @@ func rolePartitionOK(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Funct
 				if !ok {
 					continue
 				}
-				r, w := roleUsedByGo(g, root, c)
+				r, w := roleUsedByGo(g, object, c)
 				if r {
 					readers++
 				}
@@ -133,9 +143,9 @@ func rolePartitionOK(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Funct
 		if goCalleeOfSomeGo(fn, funcs) {
 			continue
 		}
-		r, w := rolesOnValueIn(fn, resolveCapture(root), c)
+		r, w := rolesOnValueIn(fn, resolveCapture(object), c)
 		if !r && !w {
-			r, w = rolesOnValueIn(fn, root, c)
+			r, w = rolesOnValueIn(fn, object, c)
 		}
 		if r {
 			readers++
@@ -197,6 +207,36 @@ func roleOfAccess(acc dataAccess, c *roleContract) string {
 	return ""
 }
 
+func bindRootAtGo(g *ssa.Go, root ssa.Value) ssa.Value {
+	if g == nil || g.Common() == nil || root == nil {
+		return root
+	}
+	cal := staticCallee(g.Common())
+	if cal == nil {
+		if mc, ok := g.Common().Value.(*ssa.MakeClosure); ok {
+			cal, _ = mc.Fn.(*ssa.Function)
+		}
+	}
+	if cal != nil {
+		for i, arg := range g.Common().Args {
+			if i < len(cal.Params) && (cal.Params[i] == root || aliasesRoot(cal.Params[i], root)) {
+				return arg
+			}
+		}
+	}
+	if mc, ok := g.Common().Value.(*ssa.MakeClosure); ok {
+		cf, _ := mc.Fn.(*ssa.Function)
+		if cf != nil {
+			for i, bind := range mc.Bindings {
+				if i < len(cf.FreeVars) && (cf.FreeVars[i] == root || aliasesRoot(cf.FreeVars[i], root)) {
+					return bind
+				}
+			}
+		}
+	}
+	return root
+}
+
 func roleOfFunc(fn *ssa.Function, c *roleContract) string {
 	for fn != nil {
 		if c.reader[fn.Name()] {
@@ -226,12 +266,10 @@ func roleUsedByGo(g *ssa.Go, root ssa.Value, c *roleContract) (reader, writer bo
 	if cal == nil {
 		return false, false
 	}
-	// Args that alias root → corresponding params.
+	// Only the go-site argument identifies the object. A callee Parameter
+	// is shared across invocations and must not alias every call.
 	for i, arg := range g.Common().Args {
-		if i >= len(cal.Params) {
-			continue
-		}
-		if !aliasesRoot(arg, root) && cal.Params[i] != root && !aliasesRoot(cal.Params[i], root) {
+		if i >= len(cal.Params) || !aliasesRoot(arg, root) {
 			continue
 		}
 		r, w := rolesOnValueIn(cal, cal.Params[i], c)

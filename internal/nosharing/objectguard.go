@@ -194,10 +194,10 @@ func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, s
 	if len(dataRoots) > 0 && stridePartitionOK(dataRoots[0], accesses) {
 		return true
 	}
-	if len(dataRoots) > 0 && leaseExclusiveOK(dataRoots[0], accesses, funcs) {
+	if len(dataRoots) > 0 && leaseExclusiveOKAt(dataRoots[0], accesses, funcs, spawner) {
 		return true
 	}
-	if len(dataRoots) > 0 && rolePartitionOK(dataRoots[0], accesses, funcs) {
+	if len(dataRoots) > 0 && rolePartitionOKAt(dataRoots[0], accesses, funcs, g) {
 		return true
 	}
 
@@ -205,6 +205,16 @@ func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, s
 	// loaded from atomic cells do not poison the parent object.
 	for _, r := range dataRoots {
 		rAcc := perRoot[r]
+		if spawner != nil && g != nil {
+			var live []dataAccess
+			for _, acc := range rAcc {
+				if acc.instr.Parent() == spawner && dominatesInstr(acc.instr, g) {
+					continue
+				}
+				live = append(live, acc)
+			}
+			rAcc = live
+		}
 		if !accessesHaveWrite(rAcc) || onlySetupWrites(rAcc) {
 			continue
 		}
@@ -232,10 +242,10 @@ func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, s
 		if stridePartitionOK(r, rAcc) {
 			continue
 		}
-		if leaseExclusiveOK(r, rAcc, funcs) {
+		if leaseExclusiveOKAt(r, rAcc, funcs, spawner) {
 			continue
 		}
-		if rolePartitionOK(r, rAcc, funcs) {
+		if rolePartitionOKAt(r, rAcc, funcs, g) {
 			continue
 		}
 		return false

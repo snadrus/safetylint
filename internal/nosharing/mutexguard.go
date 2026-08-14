@@ -212,6 +212,51 @@ func collectDataAccessesDeep(root ssa.Value, funcs map[*ssa.Function]bool, visit
 	return out
 }
 
+// escapeAliasCells finds local **T Allocs that store root (*T), the usual
+// SSA heap-escape of a captured receiver. Accesses through that cell are
+// accesses of the same object.
+func escapeAliasCells(root ssa.Value, funcs map[*ssa.Function]bool) []ssa.Value {
+	if root == nil {
+		return nil
+	}
+	var out []ssa.Value
+	seen := map[ssa.Value]bool{}
+	for fn := range funcs {
+		if fn == nil {
+			continue
+		}
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				st, ok := instr.(*ssa.Store)
+				if !ok || st.Val == nil || st.Addr == nil {
+					continue
+				}
+				if st.Val != root && !aliasesRoot(st.Val, root) {
+					continue
+				}
+				al, ok := stripToObject(st.Addr).(*ssa.Alloc)
+				if !ok || seen[al] || !isEscapeCell(al, root) {
+					continue
+				}
+				seen[al] = true
+				out = append(out, al)
+			}
+		}
+	}
+	return out
+}
+
+func isEscapeCell(al *ssa.Alloc, root ssa.Value) bool {
+	if al == nil || root == nil {
+		return false
+	}
+	if types.Identical(al.Type(), root.Type()) {
+		return true
+	}
+	p, ok := types.Unalias(al.Type()).(*types.Pointer)
+	return ok && types.Identical(types.Unalias(p.Elem()), types.Unalias(root.Type()))
+}
+
 type dataAccess struct {
 	instr ssa.Instruction
 	addr  ssa.Value // address or map value being accessed
