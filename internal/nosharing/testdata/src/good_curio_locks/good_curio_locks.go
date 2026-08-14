@@ -2,10 +2,18 @@ package good_curio_locks
 
 import "sync"
 
-// Curio index_locks shape: slot r/w under the slot mutex (canLock←tryLock
-// inherit); refs under Index.lk held across unlock().
+// Curio index_locks shape: ctxCond.L is sync.Locker, stored only as
+// *sync.Mutex via newCtxCond. Slot r/w under that Locker; refs under Index.lk.
+type ctxCond struct {
+	L sync.Locker
+}
+
+func newCtxCond(l sync.Locker) *ctxCond {
+	return &ctxCond{L: l}
+}
+
 type slot struct {
-	mu   sync.Mutex
+	cond *ctxCond
 	r    [2]int
 	refs int
 }
@@ -23,15 +31,15 @@ func (s *slot) tryLock() bool {
 }
 
 func (s *slot) lock() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.cond.L.Lock()
+	defer s.cond.L.Unlock()
 	for !s.tryLock() {
 	}
 }
 
 func (s *slot) unlock() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.cond.L.Lock()
+	defer s.cond.L.Unlock()
 	s.r[0]--
 }
 
@@ -44,7 +52,7 @@ func (i *Index) lockWith(k int) {
 	i.lk.Lock()
 	slk := i.locks[k]
 	if slk == nil {
-		slk = &slot{}
+		slk = &slot{cond: newCtxCond(&sync.Mutex{})}
 		i.locks[k] = slk
 	}
 	slk.refs++

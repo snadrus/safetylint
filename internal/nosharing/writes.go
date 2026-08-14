@@ -530,6 +530,10 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 		return false
 	}
 
+	if eff, ok := stdlibOperandEffect(c, v); ok {
+		return eff == effectWrite
+	}
+
 	// Interface method call: the iface value itself is not mutated; []byte /
 	// string payloads are treated as read-only unless a concrete body says
 	// otherwise (Broadcast-style fan-out of immutable messages).
@@ -558,6 +562,16 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 			// sites must prove atomics-only (or a lock) rather than treating
 			// them as read-only no-ops. Freeze still skips them in globalWrites.
 			return true
+		}
+		if sh, ok := lookupStdlibShape(callee); ok {
+			hasRecv := callee.Signature.Recv() != nil
+			for i, arg := range c.Args {
+				if arg != v {
+					continue
+				}
+				return shapeEffectForArg(sh, i, hasRecv) == effectWrite
+			}
+			return false
 		}
 		if isStdlibReadOnlyCall(callee) {
 			return false

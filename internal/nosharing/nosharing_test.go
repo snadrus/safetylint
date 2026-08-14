@@ -120,6 +120,9 @@ func TestNosharing(t *testing.T) {
 		"good_curio_token",
 		"good_curio_locks",
 		"good_curio_ws",
+		"good_locker",
+		"bad_locker",
+		"bad_readfull",
 		"bad_curio_locks",
 		"bad_curio_stride",
 	)

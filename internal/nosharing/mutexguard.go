@@ -276,7 +276,7 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 		if instr == nil || seen[instr] {
 			return
 		}
-		if isMutexFieldAddr(addr) {
+		if isMutexFieldAddr(addr) || (!write && isLockPathAddr(addr)) {
 			return
 		}
 		seen[instr] = true
@@ -298,12 +298,20 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 						}
 					}
 					return
-				case "append", "copy", "clear", "delete":
-					for _, arg := range c.Args {
-						if derived[arg] {
-							add(instr, arg, true)
-							return
+				case "copy":
+					if len(c.Args) > 0 && derived[c.Args[0]] {
+						add(instr, c.Args[0], true)
+					}
+					if len(c.Args) > 1 && derived[c.Args[1]] {
+						add(instr, c.Args[1], false)
+					}
+					return
+				case "append", "clear", "delete":
+					for i, arg := range c.Args {
+						if !derived[arg] {
+							continue
 						}
+						add(instr, arg, i == 0)
 					}
 					return
 				}
@@ -311,6 +319,9 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 		}
 		if cal := c.StaticCallee(); cal != nil {
 			if isWhitelistedSyncMethod(cal, recvOfCall(c)) || isRWMutexMethod(cal) || isSyncMutexMethod(cal) {
+				return
+			}
+			if addStdlibCallAccesses(instr, c, cal, derived, add) {
 				return
 			}
 			if isStdlibReadOnlyCall(cal) {
@@ -335,6 +346,21 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 				// Same-package callees are checked via their own parameters
 				// in collectDataAccessesDeep.
 				return
+			}
+		}
+		if c.IsInvoke() {
+			for _, arg := range c.Args {
+				if !derived[arg] || isMutexFieldAddr(arg) {
+					continue
+				}
+				if eff, ok := invokeOperandEffect(c, arg); ok {
+					if eff == effectWrite {
+						add(instr, arg, true)
+					} else if eff == effectRead {
+						add(instr, arg, false)
+					}
+					return
+				}
 			}
 		}
 		for _, arg := range c.Args {
@@ -843,13 +869,15 @@ func lockUnlockGuard(c *ssa.CallCommon) (guardKey, bool) {
 	if recv == nil {
 		return guardKey{}, false
 	}
-	if fa, ok := recv.(*ssa.FieldAddr); ok {
+	core := peelLockerRecv(recv)
+	if fa, ok := core.(*ssa.FieldAddr); ok {
 		isMu := isNamedSyncType(fa.Type(), "Mutex")
 		isRW := isNamedSyncType(fa.Type(), "RWMutex")
-		if !isMu && !isRW {
+		isLocker := isNamedSyncType(fa.Type(), "Locker") && lockerFieldSatisfiedByMutex(fa)
+		if !isMu && !isRW && !isLocker {
 			return guardKey{}, false
 		}
-		if isMu && (name == "RLock" || name == "RUnlock" || name == "TryRLock") {
+		if (isMu || isLocker) && (name == "RLock" || name == "RUnlock" || name == "TryRLock") {
 			return guardKey{}, false
 		}
 		return guardKey{base: resolveGuardBase(stripToObject(fa.X)), field: fa.Field}, true
@@ -865,6 +893,12 @@ func lockUnlockGuard(c *ssa.CallCommon) (guardKey, bool) {
 	if cell := freeStandingMutexCell(base); cell != nil {
 		isMu := isNamedSyncType(cell.Type(), "Mutex")
 		if isMu && (name == "RLock" || name == "RUnlock" || name == "TryRLock") {
+			return guardKey{}, false
+		}
+		return guardKey{base: cell, field: -1}, true
+	}
+	if cell := freeStandingLockerCell(core); cell != nil && lockerCellSatisfiedByMutex(cell) {
+		if name == "RLock" || name == "RUnlock" || name == "TryRLock" {
 			return guardKey{}, false
 		}
 		return guardKey{base: cell, field: -1}, true
@@ -1216,7 +1250,10 @@ func isMutexFieldAddr(v ssa.Value) bool {
 	if !ok {
 		return false
 	}
-	return isNamedSyncType(fa.Type(), "Mutex", "RWMutex")
+	if isNamedSyncType(fa.Type(), "Mutex", "RWMutex") {
+		return true
+	}
+	return isNamedSyncType(fa.Type(), "Locker") && lockerFieldSatisfiedByMutex(fa)
 }
 
 // isValueCopyArg reports an SSA value that is a non-addressable copy of data
