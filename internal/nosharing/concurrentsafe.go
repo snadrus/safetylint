@@ -193,14 +193,26 @@ func (a *analyzer) typeIsConcurrentSafe(tn *types.TypeName, methods []*ssa.Funct
 		return false
 	}
 	funcs := map[*ssa.Function]bool{}
+	var addFn func(*ssa.Function)
+	addFn = func(f *ssa.Function) {
+		if f == nil || funcs[f] {
+			return
+		}
+		funcs[f] = true
+		for r := range reachableFuncs(f, f.Pkg) {
+			if !funcs[r] {
+				addFn(r)
+			}
+		}
+		// Closures defined in methods (Add's returned remove func) hold the
+		// receiver's locks for helpers they call; they must be visible both
+		// as access sites and as callers for hold inheritance.
+		for _, anon := range f.AnonFuncs {
+			addFn(anon)
+		}
+	}
 	for _, m := range methods {
-		if m == nil {
-			continue
-		}
-		funcs[m] = true
-		for r := range reachableFuncs(m, m.Pkg) {
-			funcs[r] = true
-		}
+		addFn(m)
 	}
 	if unexportedFieldEscapes(methods, st) {
 		return false

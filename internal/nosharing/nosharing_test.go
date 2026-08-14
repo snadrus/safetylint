@@ -137,6 +137,10 @@ func TestNosharing(t *testing.T) {
 		"good_ctor_freeze",
 		"bad_ctor_postwrite",
 		"good_share_replaced",
+		"good_engine_loop",
+		"bad_engine_twoloops",
+		"good_chan_move",
+		"bad_chan_move_reuse",
 		"bad_curio_locks",
 		"bad_curio_stride",
 	)

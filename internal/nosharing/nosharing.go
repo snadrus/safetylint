@@ -18,6 +18,7 @@ package nosharing
 
 import (
 	"fmt"
+	"go/ast"
 	"go/build"
 	"go/token"
 	"go/types"
@@ -126,6 +127,9 @@ func run(pass *analysis.Pass) (any, error) {
 	}
 	if packageInModuleCache(pass) {
 		a.exportParamWriteFacts(false)
+		// ConcurrentSafe derivation lets importers drop accesses through
+		// internally-synchronized dependency types (harmonyquery.DB).
+		a.exportConcurrentSafeFacts()
 		return nil, nil
 	}
 	a.run()
@@ -174,6 +178,7 @@ type analyzer struct {
 	initConcurrent      bool
 	onceOK              map[*ssa.Global]bool
 	localConcurrentSafe map[*types.TypeName]bool
+	generated           map[string]bool // filenames with a Code generated marker
 }
 
 func (a *analyzer) run() {
@@ -239,7 +244,31 @@ func (a *analyzer) reportAt(reported map[string]bool, pos token.Pos, format stri
 		return
 	}
 	reported[key] = true
+	if a.posInGeneratedFile(pos) {
+		// Generated code (protobuf lazy rawDesc init, gRPC service tables)
+		// synchronizes through protoimpl internals the analyzer cannot see;
+		// diagnostics there are noise the author cannot act on. Analysis
+		// still runs for cross-file effects.
+		return
+	}
 	a.pass.Reportf(pos, "%s", msg)
+}
+
+// posInGeneratedFile reports whether pos falls in a file carrying the
+// standard "Code generated ... DO NOT EDIT." marker.
+func (a *analyzer) posInGeneratedFile(pos token.Pos) bool {
+	if a.pass == nil || !pos.IsValid() {
+		return false
+	}
+	if a.generated == nil {
+		a.generated = map[string]bool{}
+		for _, f := range a.pass.Files {
+			if ast.IsGenerated(f) {
+				a.generated[a.pass.Fset.Position(f.Pos()).Filename] = true
+			}
+		}
+	}
+	return a.generated[a.pass.Fset.Position(pos).Filename]
 }
 
 func (a *analyzer) checkGo(g *ssa.Go, spawner *ssa.Function, globals map[*ssa.Global]bool, reported map[string]bool) {

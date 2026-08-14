@@ -212,6 +212,9 @@ func accessesGuarded(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Funct
 	if rolePartitionOK(root, accesses, funcs) {
 		return true
 	}
+	if singleOwnerGoroutineOK(root, accesses, funcs) {
+		return true
+	}
 	return false
 }
 
@@ -357,6 +360,14 @@ func objectGuardedRootsAfter(pass *analysis.Pass, roots []sharedRoot, funcs map[
 	if len(dataRoots) > 0 && rolePartitionOKAt(dataRoots[0], accesses, funcs, g) {
 		return true
 	}
+	// Single-owner runs on the same-object union only: per-root access
+	// lists hide sibling goroutines touching the same memory.
+	if len(dataRoots) > 0 && singleOwnerGoroutineOK(dataRoots[0], accesses, funcs) {
+		return true
+	}
+	if len(dataRoots) > 0 && fieldSingleOwnerOK(dataRoots[0], accesses, funcs) {
+		return true
+	}
 
 	// Atomics (and other per-object proofs) run per written root so values
 	// loaded from atomic cells do not poison the parent object.
@@ -403,6 +414,14 @@ func objectGuardedRootsAfter(pass *analysis.Pass, roots []sharedRoot, funcs map[
 			continue
 		}
 		if rolePartitionOKAt(r, rAcc, funcs, g) {
+			continue
+		}
+		// Ownership over the union (not rAcc): sibling closures' accesses
+		// must be visible or two event loops would each look like one owner.
+		if singleOwnerGoroutineOK(r, accesses, funcs) {
+			continue
+		}
+		if fieldSingleOwnerOK(r, accesses, funcs) {
 			continue
 		}
 		return false
