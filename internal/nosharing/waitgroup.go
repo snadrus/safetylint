@@ -372,6 +372,14 @@ func spawnerTouchesBetween(root ssa.Value, fn *ssa.Function, g *ssa.Go, wait ssa
 					}
 				}
 			}
+			// Sibling MakeClosure / Go that capture the same cell are not
+			// parent touches — sibling access is checked separately.
+			if _, ok := ref.(*ssa.MakeClosure); ok {
+				continue
+			}
+			if _, ok := ref.(*ssa.Go); ok {
+				continue
+			}
 			// Touch strictly after g and strictly before wait.
 			if dominatesInstr(g, ref) && dominatesInstr(ref, wait) {
 				return true

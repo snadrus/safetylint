@@ -2,7 +2,7 @@ package good_mutexstruct
 
 import "sync"
 
-type Counter struct {
+type Counter struct { // want Counter:"concurrentSafe"
 	mu sync.Mutex
 	n  int
 }

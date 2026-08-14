@@ -1,7 +1,7 @@
 package good_nested_client
 
 // Outer is shared read-only; nested Client is a separately allocated object.
-type Client struct {
+type Client struct { // want Client:"concurrentSafe"
 	hits int
 }
 

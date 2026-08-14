@@ -807,7 +807,7 @@ func lockUnlockGuard(c *ssa.CallCommon) (guardKey, bool) {
 		if isMu && (name == "RLock" || name == "RUnlock" || name == "TryRLock") {
 			return guardKey{}, false
 		}
-		return guardKey{base: stripToObject(fa.X), field: fa.Field}, true
+		return guardKey{base: resolveGuardBase(stripToObject(fa.X)), field: fa.Field}, true
 	}
 	// Free-standing Mutex / *Mutex / RWMutex / *RWMutex: package Global or
 	// stack/heap Alloc (fan-out local locks under WaitGroup). Closure FreeVars
@@ -826,6 +826,42 @@ func lockUnlockGuard(c *ssa.CallCommon) (guardKey, bool) {
 	}
 	// Custom Lock/Unlock/RLock/RUnlock methods that wrap a tied field.
 	return wrapperLockGuard(c, name, base)
+}
+
+// resolveGuardBase canonicalizes a mutex-bearing object to Alloc/Global when
+// the SSA name is a FreeVar bound to one.
+func resolveGuardBase(v ssa.Value) ssa.Value {
+	if v == nil {
+		return v
+	}
+	if cell := freeStandingMutexCell(v); cell != nil {
+		return cell
+	}
+	if fv, ok := v.(*ssa.FreeVar); ok && fv.Parent() != nil {
+		enc := fv.Parent().Parent()
+		if enc == nil {
+			return v
+		}
+		for _, b := range enc.Blocks {
+			for _, instr := range b.Instrs {
+				mc, ok := instr.(*ssa.MakeClosure)
+				if !ok {
+					continue
+				}
+				cf, _ := mc.Fn.(*ssa.Function)
+				if cf != fv.Parent() {
+					continue
+				}
+				for i, bind := range mc.Bindings {
+					if i >= len(cf.FreeVars) || cf.FreeVars[i] != fv {
+						continue
+					}
+					return stripToObject(bind)
+				}
+			}
+		}
+	}
+	return v
 }
 
 // freeStandingMutexCell returns the Global/Alloc identity of a free-standing
@@ -1146,6 +1182,9 @@ func isValueCopyArg(v ssa.Value) bool {
 	}
 	if _, ok := v.(*ssa.Field); ok {
 		return true
+	}
+	if _, ok := v.(*ssa.Extract); ok {
+		return !mayContainPointers(v.Type())
 	}
 	if u, ok := v.(*ssa.UnOp); ok && u.Op == token.MUL {
 		return !typeIsIndirect(u.Type())

@@ -293,7 +293,6 @@ func (a *analyzer) resolveFuncFreeVarAddr(fv *ssa.FreeVar, visiting map[ssa.Valu
 	return out
 }
 
-
 // funcFieldExported reports an address of an exported struct field.
 func funcFieldExported(addr ssa.Value) bool {
 	addr = stripFuncAddr(addr)

@@ -117,6 +117,69 @@ func valueSnapshotReadOnly(root ssa.Value, spawner *ssa.Function, g *ssa.Go) boo
 	return onlyWholeValueReassignAfterGo(root, spawner, g)
 }
 
+// loopLocalCellOK reports that root is (or is a FreeVar of) an Alloc that
+// dominates g inside a loop: each iteration allocates a fresh cell. Post-go
+// whole-cell stores in the spawner rebind the next iteration and do not
+// race with this capture. Field/index stores after go fail the proof.
+func loopLocalCellOK(root ssa.Value, spawner *ssa.Function, g *ssa.Go) bool {
+	if root == nil || spawner == nil || g == nil {
+		return false
+	}
+	var alloc *ssa.Alloc
+	switch v := root.(type) {
+	case *ssa.Alloc:
+		alloc = v
+	case *ssa.FreeVar:
+		cells := closureBindingCells(spawner, v)
+		if len(cells) != 1 {
+			return false
+		}
+		a, ok := cells[0].(*ssa.Alloc)
+		if !ok {
+			return false
+		}
+		alloc = a
+	default:
+		return false
+	}
+	ab := alloc.Block()
+	gb := g.Block()
+	if ab == nil || gb == nil || !blockInCycle(ab) {
+		return false
+	}
+	if !dominatesInstr(alloc, g) {
+		return false
+	}
+	// Same strongly-connected component: go is in the loop that reallocates.
+	if !ab.Dominates(gb) && ab != gb {
+		return false
+	}
+	derived := deriveOwnAddrs(alloc, map[*ssa.Function]bool{spawner: true})
+	for v := range derived {
+		refs := v.Referrers()
+		if refs == nil {
+			continue
+		}
+		for _, ref := range *refs {
+			if ref.Parent() != spawner || ref == g {
+				continue
+			}
+			st, ok := ref.(*ssa.Store)
+			if !ok {
+				continue
+			}
+			if !dominatesInstr(g, st) {
+				continue
+			}
+			switch st.Addr.(type) {
+			case *ssa.FieldAddr, *ssa.IndexAddr:
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func onlyWholeValueReassignAfterGo(root ssa.Value, fn *ssa.Function, g *ssa.Go) bool {
 	goBlock := g.Block()
 	goIdx := instrIndex(goBlock, g)
@@ -479,9 +542,15 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 		}
 	}
 
+	// A pointer-free value or Field/Extract/non-indirect load is a copy;
+	// the callee cannot write the caller's cell through it.
+	if isValueCopyArg(v) || !mayContainPointers(v.Type()) {
+		return false
+	}
+
 	callee := c.StaticCallee()
 	if callee != nil {
-		if isShareSafeStdlib(v) {
+		if isConcurrentSafeValue(v) {
 			return false
 		}
 		if isAtomicCallee(callee) {
@@ -519,7 +588,7 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 		return false
 	}
 
-	if isShareSafeStdlib(v) {
+	if isConcurrentSafeValue(v) {
 		return false
 	}
 	// Func values / unknown callees: keep []byte/string as read-only payloads
@@ -628,10 +697,7 @@ func isSingleflightGroup(t types.Type) bool {
 // concurrent sharing without a caller-held sync.Mutex (context.Context and
 // *net/http.Server's Serve/Shutdown protocol).
 func isShareSafeStdlib(v ssa.Value) bool {
-	if v == nil {
-		return false
-	}
-	return isContextType(v.Type()) || isHTTPServerType(v.Type())
+	return isConcurrentSafeValue(v)
 }
 
 func isContextType(t types.Type) bool {

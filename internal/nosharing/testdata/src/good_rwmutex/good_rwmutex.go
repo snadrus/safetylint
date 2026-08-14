@@ -2,7 +2,7 @@ package good_rwmutex
 
 import "sync"
 
-type Counter struct {
+type Counter struct { // want Counter:"concurrentSafe"
 	mu sync.RWMutex
 	n  int
 }

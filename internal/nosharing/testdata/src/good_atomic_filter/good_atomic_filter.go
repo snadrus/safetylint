@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 )
 
-type Filter struct {
+type Filter struct { // want Filter:"concurrentSafe"
 	ptr atomic.Pointer[map[string]struct{}]
 	ctx context.Context
 }

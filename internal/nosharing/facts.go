@@ -84,6 +84,17 @@ func (*InitOnly) AFact() {}
 
 func (*InitOnly) String() string { return "initOnly" }
 
+// ConcurrentSafe is an object Fact on *types.TypeName: values of this named
+// type may be shared across goroutines without caller-side synchronization,
+// because every access to the type's own state inside its methods is guarded
+// (per-field mutex, sync/atomic, frozen fields, channels, or nested
+// ConcurrentSafe fields), or the type is a curated concurrent-safe API.
+type ConcurrentSafe struct{}
+
+func (*ConcurrentSafe) AFact() {}
+
+func (*ConcurrentSafe) String() string { return "concurrentSafe" }
+
 // HotGlobals is a package Fact: globals that init-time goroutines may
 // concurrently access after init returns (and thus after main starts).
 // Writers must use the tied mutex when set, or avoid post-concurrency writes.

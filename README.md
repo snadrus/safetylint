@@ -11,7 +11,9 @@ goroutines share mutable memory. safetylint refuses the escape hatches and
 then refuses cross-goroutine sharing except via channels with
 **freeze-after-send** for pointer-carrying values, or via a **proven guard**:
 tied/`free-standing` mutexes, RWMutex Lock/RLock discipline, atomics-only
-touches, or const-index partitioned buffer writers.
+touches, const-index or stride-partitioned buffer writers, exclusive
+channel-token / mutex-pool leases, curated one-reader/one-writer roles,
+or a `ConcurrentSafe` type Fact.
 
 Note: *Exotic* locking simply fails. Just like Escape analysis,
 if you feel like getting complicated, I just haven't implemented your case yet. PRs are welcomed. Keep things in-package when you can. 
@@ -62,8 +64,29 @@ doubt, it **rejects**):
         under `Lock`, every read under `Lock` or `RLock`;
      4. **atomics-only** concurrent touches (`sync/atomic`);
      5. **const-index partitioned** slice/array writers (disjoint indexes,
-        no concurrent reads / header mutation).
-     Different mutex fields of the same struct are not interchangeable.
+        no concurrent reads / header mutation);
+     6. **consistent / per-field mutex**: one mutex (not necessarily a field
+        of the accessed object) held at every touch, or a stable mutex per
+        field (race-freedom, not multi-field atomicity);
+     7. **frozen unexported fields** (stores only on a local Alloc that
+        dominates every spawn in that function) do not need the lock and
+        do not poison mutex proofs;
+     8. **exclusive lease**: a channel token index into a buffer, or a
+        value popped from a mutex-protected pool and pushed back under the
+        same mutex;
+     9. **stride range partition** `start=w*k`, `end=min((w+1)*k,n)` from a
+        step-1 spawning loop, writes confined to `[start,end)`;
+     10. **role partition** (curated `oneReaderOneWriter`, e.g. gorilla
+         `*websocket.Conn`): at most one reader-role and one writer-role
+         goroutine, no field access.
+     A named type may be published as **`ConcurrentSafe`** when every
+     mutable field is guarded / frozen / atomic / a channel / nested
+     ConcurrentSafe and no unexported state escapes. Curated anchors
+     cover GOROOT/module-cache types (`os.File`, `http.Client`/`Server`,
+     `sql.DB`, `context.Context`, `sync.Map`, `singleflight.Group`,
+     `pgxpool.Pool`, `hashicorp/golang-lru`).
+     Different mutex fields of the same struct are not interchangeable
+     for a *single* field (a field may not flip between two mutexes).
      Writes through separately heap-allocated objects reached only via
      pointer fields of the shared value do not count as writing that value
      (e.g. `cfg.DB.Query` does not write `*Cfg`); module-cache callees export
@@ -204,6 +227,10 @@ safetylint prefers false rejections over missed races:
   the package spawns goroutines anywhere: other packages could call them
   concurrently.
 - Alias analysis is conservative SSA def-use, not a full points-to analysis.
+- Single-producer/single-consumer ring buffers (atomic cursors + wrap,
+  e.g. a prefetch reader) are **not** recognized; they stay refused.
+  The recognizer is not implemented because a loose match is the highest
+  over-permissiveness risk in this set.
 
 ## Architecture
 

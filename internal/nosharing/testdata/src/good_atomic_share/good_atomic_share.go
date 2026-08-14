@@ -2,7 +2,7 @@ package good_atomic_share
 
 import "sync/atomic"
 
-type Filter struct {
+type Filter struct { // want Filter:"concurrentSafe"
 	ptr atomic.Pointer[int]
 }
 

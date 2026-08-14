@@ -6,7 +6,7 @@ type Inner struct {
 	n int
 }
 
-type Outer struct {
+type Outer struct { // want Outer:"concurrentSafe"
 	mu    sync.Mutex
 	inner Inner
 }

@@ -23,6 +23,7 @@ func objectGuarded(root ssa.Value, funcs map[*ssa.Function]bool) bool {
 
 // accessesGuarded runs the guard cascade over a precomputed access list.
 func accessesGuarded(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Function]bool) bool {
+	accesses = filterFrozenReads(root, accesses, funcs)
 	if len(accesses) == 0 {
 		return true
 	}
@@ -39,6 +40,50 @@ func accessesGuarded(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Funct
 		return true
 	}
 	if constIndexPartitionOK(root, accesses) {
+		return true
+	}
+	if consistentMutexGuards(accesses, funcs) {
+		return true
+	}
+	if fieldMutexGuards(root, accesses, funcs) {
+		return true
+	}
+	if stridePartitionOK(root, accesses) {
+		return true
+	}
+	if leaseExclusiveOK(root, accesses, funcs) {
+		return true
+	}
+	if rolePartitionOK(root, accesses, funcs) {
+		return true
+	}
+	return false
+}
+
+// accessesGuardedType is the ConcurrentSafe-derivation cascade: mutex,
+// atomics, frozen fields, and nested ConcurrentSafe only. Site-local
+// proofs (lease / stride / role) are not type-level properties.
+func accessesGuardedType(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Function]bool) bool {
+	accesses = filterFrozenReads(root, accesses, funcs)
+	if len(accesses) == 0 {
+		return true
+	}
+	if hasTiedMutex(findStructuralGuards(root), accesses) {
+		return true
+	}
+	if freeStandingMutexGuards(accesses, funcs, false) {
+		return true
+	}
+	if rwMutexGuards(root, accesses, funcs) {
+		return true
+	}
+	if atomicsOnlyAccesses(accesses) {
+		return true
+	}
+	if consistentMutexGuards(accesses, funcs) {
+		return true
+	}
+	if fieldMutexGuards(root, accesses, funcs) {
 		return true
 	}
 	return false
@@ -69,7 +114,7 @@ func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, s
 	var dataRoots []ssa.Value
 	perRoot := map[ssa.Value][]dataAccess{}
 	for _, root := range roots {
-		if isChanType(root.val.Type()) || isWhitelistedSync(root.val) || isSyncMutex(root.val) || isSyncRWMutex(root.val) || isShareSafeStdlib(root.val) {
+		if isChanType(root.val.Type()) || isWhitelistedSync(root.val) || isSyncMutex(root.val) || isSyncRWMutex(root.val) || isConcurrentSafeValue(root.val) {
 			continue
 		}
 		// Package globals are covered by freeze analysis; including them here
@@ -79,7 +124,7 @@ func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, s
 		}
 		dataRoots = append(dataRoots, root.val)
 		rootVisiting := map[ssa.Value]bool{}
-		rAcc := collectDataAccessesDeep(root.val, funcs, rootVisiting)
+		rAcc := filterFrozenReads(root.val, collectDataAccessesDeep(root.val, funcs, rootVisiting), funcs)
 		perRoot[root.val] = rAcc
 		for _, acc := range rAcc {
 			if seenAcc[acc.instr] {
@@ -140,6 +185,21 @@ func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, s
 	if len(dataRoots) > 0 && constIndexPartitionOK(dataRoots[0], accesses) {
 		return true
 	}
+	if consistentMutexGuards(accesses, funcs) {
+		return true
+	}
+	if len(dataRoots) > 0 && fieldMutexGuards(dataRoots[0], accesses, funcs) {
+		return true
+	}
+	if len(dataRoots) > 0 && stridePartitionOK(dataRoots[0], accesses) {
+		return true
+	}
+	if len(dataRoots) > 0 && leaseExclusiveOK(dataRoots[0], accesses, funcs) {
+		return true
+	}
+	if len(dataRoots) > 0 && rolePartitionOK(dataRoots[0], accesses, funcs) {
+		return true
+	}
 
 	// Atomics (and other per-object proofs) run per written root so values
 	// loaded from atomic cells do not poison the parent object.
@@ -161,6 +221,21 @@ func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, s
 			continue
 		}
 		if atomicsOnlyAccesses(rAcc) {
+			continue
+		}
+		if consistentMutexGuards(rAcc, funcs) {
+			continue
+		}
+		if fieldMutexGuards(r, rAcc, funcs) {
+			continue
+		}
+		if stridePartitionOK(r, rAcc) {
+			continue
+		}
+		if leaseExclusiveOK(r, rAcc, funcs) {
+			continue
+		}
+		if rolePartitionOK(r, rAcc, funcs) {
 			continue
 		}
 		return false

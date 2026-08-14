@@ -42,8 +42,13 @@ sharing discipline, with proven lock / atomic / partition exceptions:
     the guard cascade: tied sync.Mutex field (including Lock/Unlock/RLock/
     RUnlock methods that always wrap that field); free-standing package
     Mutex/RWMutex held at every touch; RWMutex Lock writes / Lock|RLock reads;
-    concurrent touches only via sync/atomic; or const-index partitioned
-    slice/array writers. TryLock/TryRLock only count on proven-true paths.
+    concurrent touches only via sync/atomic; const-index or stride-partitioned
+    slice/array writers; a consistent (possibly non-tied) mutex; per-field
+    mutexes; exclusive channel-token / pool leases; or a curated
+    one-reader/one-writer role contract. ConcurrentSafe types (derived or
+    curated: os.File, http.Client/Server, sql.DB, context, sync.Map, …)
+    may be shared without caller-side synchronization. TryLock/TryRLock
+    only count on proven-true paths.
   - Values may transfer between goroutines through channels. If a sent value
     contains pointers, those pointees are frozen after send: no further writes
     through the sender's or receiver's view of that memory are allowed.
@@ -78,6 +83,7 @@ var Analyzer = &analysis.Analyzer{
 		new(InitOnly),
 		new(HotGlobals),
 		new(WritesParams),
+		new(ConcurrentSafe),
 	},
 }
 
@@ -110,12 +116,13 @@ func run(pass *analysis.Pass) (any, error) {
 	}
 	ssainfo := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 	a := &analyzer{
-		pass:          pass,
-		pkg:           ssainfo.Pkg,
-		funcs:         ssainfo.SrcFuncs,
-		localShare:    map[*types.Func]*MayShareParams{},
-		localSpawn:    map[*types.Func]bool{},
-		localInitOnly: map[*types.Func]bool{},
+		pass:                pass,
+		pkg:                 ssainfo.Pkg,
+		funcs:               ssainfo.SrcFuncs,
+		localShare:          map[*types.Func]*MayShareParams{},
+		localSpawn:          map[*types.Func]bool{},
+		localInitOnly:       map[*types.Func]bool{},
+		localConcurrentSafe: map[*types.TypeName]bool{},
 	}
 	if packageInModuleCache(pass) {
 		a.exportParamWriteFacts()
@@ -157,15 +164,16 @@ func packageInModuleCache(pass *analysis.Pass) bool {
 }
 
 type analyzer struct {
-	pass           *analysis.Pass
-	pkg            *ssa.Package
-	funcs          []*ssa.Function
-	localShare     map[*types.Func]*MayShareParams
-	localSpawn     map[*types.Func]bool
-	localInitOnly  map[*types.Func]bool
-	localHot       *HotGlobals
-	initConcurrent bool
-	onceOK         map[*ssa.Global]bool
+	pass                *analysis.Pass
+	pkg                 *ssa.Package
+	funcs               []*ssa.Function
+	localShare          map[*types.Func]*MayShareParams
+	localSpawn          map[*types.Func]bool
+	localInitOnly       map[*types.Func]bool
+	localHot            *HotGlobals
+	initConcurrent      bool
+	onceOK              map[*ssa.Global]bool
+	localConcurrentSafe map[*types.TypeName]bool
 }
 
 func (a *analyzer) run() {
@@ -206,6 +214,7 @@ func (a *analyzer) run() {
 		a.exportShareFacts()
 		a.exportInitOnlyFacts()
 		a.exportHotGlobals()
+		a.exportConcurrentSafeFacts()
 	}
 	a.checkShareFactCalls(reported)
 	a.checkAsyncCallbackShares(reported)
@@ -257,7 +266,7 @@ func (a *analyzer) checkGoCallee(g *ssa.Go, spawner, callee *ssa.Function, globa
 		if isChanType(root.val.Type()) {
 			continue
 		}
-		if isWhitelistedSync(root.val) || isSyncMutex(root.val) || isSyncRWMutex(root.val) || isShareSafeStdlib(root.val) {
+		if isWhitelistedSync(root.val) || isSyncMutex(root.val) || isSyncRWMutex(root.val) || a.isConcurrentSafeValue(root.val) {
 			// WaitGroup/Once/Mutex/RWMutex objects are pure synchronization.
 			// context.Context and *http.Server are stdlib-safe to share.
 			continue
@@ -278,6 +287,11 @@ func (a *analyzer) checkGoCallee(g *ssa.Go, spawner, callee *ssa.Function, globa
 		// read there: ignore spawner reassignment of the capture cell
 		// (loop-local map lookups under a lock, Go 1.22+ per-iteration vars).
 		if writtenAfter && !writtenInGoro && valueSnapshotReadOnly(root.val, spawner, g) {
+			writtenAfter = false
+		}
+		// Per-iteration loop-local Alloc: the go captures this iteration's
+		// cell; post-go whole-cell stores are the next iteration's instance.
+		if loopLocalCellOK(root.val, spawner, g) {
 			writtenAfter = false
 		}
 		// WaitGroup fan-out/join: exclusive ownership of result locals after Wait

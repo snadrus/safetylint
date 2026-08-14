@@ -208,7 +208,9 @@ func (a *analyzer) callSiteIndex() (map[*ssa.Function][]freezeSite, map[*ssa.Fun
 	sites := map[*ssa.Function][]freezeSite{}
 	goBody := map[*ssa.Function]bool{}
 	addrTaken := map[*ssa.Function]bool{}
-	inPkg := func(f *ssa.Function) bool { return f != nil && (f.Pkg == a.pkg || (f.Origin() != nil && f.Origin().Pkg == a.pkg)) }
+	inPkg := func(f *ssa.Function) bool {
+		return f != nil && (f.Pkg == a.pkg || (f.Origin() != nil && f.Origin().Pkg == a.pkg))
+	}
 	for _, fn := range a.funcs {
 		if fn == nil {
 			continue

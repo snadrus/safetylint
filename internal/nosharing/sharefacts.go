@@ -166,7 +166,7 @@ func (a *analyzer) sharedParamsOf(fn *ssa.Function, allFuncs map[*ssa.Function]b
 	}
 	found := map[key]SharedParam{}
 
-		heapAlias := heapParamAliases(fn)
+	heapAlias := heapParamAliases(fn)
 	goroFuncs := goroutineReachableFrom(fn, a.pkg)
 
 	record := func(paramLike ssa.Value, extra ...ssa.Value) {
@@ -548,7 +548,7 @@ func (a *analyzer) checkShareEvent(callFn *ssa.Function, callInstr ssa.Instructi
 	seen := map[ssa.Instruction]bool{}
 	visiting := map[ssa.Value]bool{}
 	for _, r := range roots {
-		if isChanType(r.val.Type()) || isWhitelistedSync(r.val) || isSyncMutex(r.val) || isShareSafeStdlib(r.val) {
+		if isChanType(r.val.Type()) || isWhitelistedSync(r.val) || isSyncMutex(r.val) || isConcurrentSafeValue(r.val) {
 			continue
 		}
 		for _, acc := range collectDataAccessesDeep(r.val, allFuncs, visiting) {
@@ -582,7 +582,7 @@ func (a *analyzer) checkShareEvent(callFn *ssa.Function, callInstr ssa.Instructi
 	// No Fact-tied mutex: allow if the cascade proves a guard (free-standing,
 	// RWMutex, atomics-only, or partitioned writers) over post-share accesses.
 	for _, r := range roots {
-		if isChanType(r.val.Type()) || isWhitelistedSync(r.val) || isSyncMutex(r.val) || isShareSafeStdlib(r.val) {
+		if isChanType(r.val.Type()) || isWhitelistedSync(r.val) || isSyncMutex(r.val) || isConcurrentSafeValue(r.val) {
 			continue
 		}
 		if accessesGuarded(r.val, accesses, allFuncs) {

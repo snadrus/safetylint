@@ -14,7 +14,7 @@ type peer struct {
 	tasks map[string]struct{}
 }
 
-type Registry struct {
+type Registry struct { // want Registry:"concurrentSafe"
 	mu     sync.RWMutex
 	peers  map[int64]peer
 	byTask map[string]map[int64]struct{}
