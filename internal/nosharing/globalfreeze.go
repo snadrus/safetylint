@@ -160,6 +160,7 @@ func (a *analyzer) globalGuardedPostSpawn(gl *ssa.Global, allFuncs map[*ssa.Func
 		}
 		live = append(live, acc)
 	}
+	live = dropConcurrentSafeFieldAccesses(a.pass, live)
 	return accessesGuarded(gl, live, allFuncs)
 }
 

@@ -49,6 +49,15 @@ func isConcurrentSafeValue(v ssa.Value) bool {
 	return isConcurrentSafeType(nil, v.Type())
 }
 
+// isConcurrentSafeValuePass is the Fact-aware variant: anchors plus
+// ConcurrentSafe Facts imported from other packages.
+func isConcurrentSafeValuePass(pass *analysis.Pass, v ssa.Value) bool {
+	if v == nil {
+		return false
+	}
+	return isConcurrentSafeType(pass, v.Type())
+}
+
 func (a *analyzer) isConcurrentSafeValue(v ssa.Value) bool {
 	if v == nil {
 		return false
@@ -229,7 +238,20 @@ func (a *analyzer) typeIsConcurrentSafe(tn *types.TypeName, methods []*ssa.Funct
 	if recv0 == nil {
 		return false
 	}
-	return accessesGuardedType(recv0, accesses, funcs)
+	// Chan-typed cells (and other inherently safe fields) carry their own
+	// synchronization: a once-under-lock initialized done channel read by
+	// select outside the lock must not fail the tied-mutex proof.
+	var rest []dataAccess
+	for _, acc := range accesses {
+		if acc.addr != nil && (isChanType(acc.addr.Type()) || a.fieldInherentlySafe(acc.addr.Type()) || a.fieldInherentlySafe(pointeeType(acc.addr.Type()))) {
+			continue
+		}
+		rest = append(rest, acc)
+	}
+	if len(rest) == 0 {
+		return true
+	}
+	return accessesGuardedType(recv0, rest, funcs)
 }
 
 func (a *analyzer) exportedPlainFields(st *types.Struct) bool {
@@ -253,8 +275,15 @@ func (a *analyzer) fieldInherentlySafe(t types.Type) bool {
 	if fieldInherentlySafe(t) {
 		return true
 	}
+	if a == nil {
+		return false
+	}
+	// Imported ConcurrentSafe Facts (cross-package promise.Promise etc.).
+	if a.pass != nil && isConcurrentSafeType(a.pass, t) {
+		return true
+	}
 	tn := namedTypeName(t)
-	return a != nil && tn != nil && a.localConcurrentSafe[tn]
+	return tn != nil && a.localConcurrentSafe[tn]
 }
 
 func fieldInherentlySafe(t types.Type) bool {

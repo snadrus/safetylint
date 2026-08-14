@@ -5,8 +5,54 @@ import (
 	"go/token"
 	"go/types"
 
+	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ssa"
 )
+
+// dropConcurrentSafeFieldAccesses removes loads of, and method calls
+// through, fields/cells whose type is ConcurrentSafe (anchor or imported
+// Fact): a *sql.DB read or a mutex-guarded promise.Promise method call is
+// safe wherever the value is shared. Stores and map updates that rebind the
+// cell itself are kept — replacing t.db still races with concurrent readers.
+func dropConcurrentSafeFieldAccesses(pass *analysis.Pass, accesses []dataAccess) []dataAccess {
+	if pass == nil {
+		return accesses
+	}
+	// A store that rebinds a ConcurrentSafe-typed cell (t.db = other) makes
+	// concurrent loads of that cell racy again: keep everything when any
+	// such rebind exists so the reads participate in the guard proofs.
+	for _, acc := range accesses {
+		switch acc.instr.(type) {
+		case *ssa.Store, *ssa.MapUpdate:
+			if acc.addr != nil && safeCellType(pass, acc.addr.Type()) {
+				return accesses
+			}
+		}
+	}
+	out := accesses[:0:0]
+	for _, acc := range accesses {
+		if concurrentSafeFieldAccess(pass, acc) {
+			continue
+		}
+		out = append(out, acc)
+	}
+	return out
+}
+
+func safeCellType(pass *analysis.Pass, t types.Type) bool {
+	return isConcurrentSafeType(pass, t) || isConcurrentSafeType(pass, pointeeType(t))
+}
+
+func concurrentSafeFieldAccess(pass *analysis.Pass, acc dataAccess) bool {
+	if acc.addr == nil {
+		return false
+	}
+	switch acc.instr.(type) {
+	case *ssa.Store, *ssa.MapUpdate:
+		return false
+	}
+	return safeCellType(pass, acc.addr.Type())
+}
 
 // objectGuarded reports whether every data access to root in funcs is proven
 // safe by the north-star cascade:
@@ -95,16 +141,16 @@ func accessesGuardedType(root ssa.Value, accesses []dataAccess, funcs map[*ssa.F
 // values loaded out of atomic cells (separate heap objects) do not poison the
 // parent object's atomics-only proof.
 func objectGuardedRoots(roots []sharedRoot, funcs map[*ssa.Function]bool) bool {
-	return objectGuardedRootsAfter(roots, funcs, nil, nil)
+	return objectGuardedRootsAfter(nil, roots, funcs, nil, nil)
 }
 
 // mutexGuardsGoRootsAfter is mutexGuardsGoRoots ignoring spawner accesses that
 // dominate the go (construction / init before the value is shared).
-func mutexGuardsGoRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, spawner *ssa.Function, g *ssa.Go) bool {
-	return objectGuardedRootsAfter(roots, funcs, spawner, g)
+func mutexGuardsGoRootsAfter(pass *analysis.Pass, roots []sharedRoot, funcs map[*ssa.Function]bool, spawner *ssa.Function, g *ssa.Go) bool {
+	return objectGuardedRootsAfter(pass, roots, funcs, spawner, g)
 }
 
-func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, spawner *ssa.Function, g *ssa.Go) bool {
+func objectGuardedRootsAfter(pass *analysis.Pass, roots []sharedRoot, funcs map[*ssa.Function]bool, spawner *ssa.Function, g *ssa.Go) bool {
 	if len(roots) >= maxRootAliases {
 		return false
 	}
@@ -125,6 +171,7 @@ func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, s
 		dataRoots = append(dataRoots, root.val)
 		rootVisiting := map[ssa.Value]bool{}
 		rAcc := filterFrozenReads(root.val, collectDataAccessesDeep(root.val, funcs, rootVisiting), funcs)
+		rAcc = dropConcurrentSafeFieldAccesses(pass, rAcc)
 		perRoot[root.val] = rAcc
 		for _, acc := range rAcc {
 			if seenAcc[acc.instr] {

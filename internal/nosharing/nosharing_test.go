@@ -125,6 +125,9 @@ func TestNosharing(t *testing.T) {
 		"bad_readfull",
 		"good_global_nestedmu",
 		"bad_global_nestedmu",
+		"promiselib",
+		"good_promise_poll",
+		"bad_safefield_rebind",
 		"bad_curio_locks",
 		"bad_curio_stride",
 	)

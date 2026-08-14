@@ -9,7 +9,7 @@ type Svc struct {
 
 func New() *Svc {
 	s := &Svc{db: &db{id: 1}}
-	go s.loop() // want `shared memory`
+	go s.loop()       // want `shared memory`
 	s.db = &db{id: 2} // store after publish
 	return s
 }

@@ -4,6 +4,7 @@ import (
 	"go/token"
 	"go/types"
 
+	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ssa"
 )
 
@@ -183,6 +184,10 @@ type holdSet map[guardKey]holdMode
 // same-package callees that receive root-derived values, so a single tied
 // mutex can be required across all touchpoints.
 func collectDataAccessesDeep(root ssa.Value, funcs map[*ssa.Function]bool, visiting map[ssa.Value]bool) []dataAccess {
+	return collectDataAccessesDeepPass(nil, root, funcs, visiting)
+}
+
+func collectDataAccessesDeepPass(pass *analysis.Pass, root ssa.Value, funcs map[*ssa.Function]bool, visiting map[ssa.Value]bool) []dataAccess {
 	if root == nil || visiting[root] {
 		return nil
 	}
@@ -199,7 +204,7 @@ func collectDataAccessesDeep(root ssa.Value, funcs map[*ssa.Function]bool, visit
 			out = append(out, acc)
 		}
 	}
-	addAll(collectDataAccesses(root, funcs))
+	addAll(collectDataAccessesPass(pass, root, funcs))
 
 	derived := deriveAddrs(root, funcs)
 	for fn := range funcs {
@@ -234,7 +239,7 @@ func collectDataAccessesDeep(root ssa.Value, funcs map[*ssa.Function]bool, visit
 						continue
 					}
 					calFuncs := reachableFuncs(cal, cal.Pkg)
-					addAll(collectDataAccessesDeep(cal.Params[i], calFuncs, visiting))
+					addAll(collectDataAccessesDeepPass(pass, cal.Params[i], calFuncs, visiting))
 				}
 			}
 		}
@@ -298,6 +303,10 @@ type dataAccess struct {
 // It scans instructions directly so Global roots (which lack Referrers)
 // are handled uniformly.
 func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAccess {
+	return collectDataAccessesPass(nil, root, funcs)
+}
+
+func collectDataAccessesPass(pass *analysis.Pass, root ssa.Value, funcs map[*ssa.Function]bool) []dataAccess {
 	var out []dataAccess
 	seen := map[ssa.Instruction]bool{}
 	derived := deriveAddrs(root, funcs)
@@ -376,6 +385,19 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 				// Same-package callees are checked via their own parameters
 				// in collectDataAccessesDeep.
 				return
+			}
+			// Bodyless cross-package callee: a WritesParams Fact from the
+			// defining package classifies the argument precisely (read-only
+			// helper vs mutator) instead of the pessimistic write below.
+			for _, arg := range c.Args {
+				if !derived[arg] || isMutexFieldAddr(arg) {
+					continue
+				}
+				if known, w := writesParamsFact(pass, c, arg); known {
+					add(instr, arg, w)
+					return
+				}
+				break
 			}
 		}
 		if c.IsInvoke() {

@@ -510,9 +510,12 @@ func (a *analyzer) checkShareFactCalls(reported map[string]bool) {
 					continue
 				}
 				for _, sp := range fact.Params {
-					// Same-package write shares without a tied mutex are
-					// already refused at the go site by checkGo.
-					if cal.Pkg == a.pkg && sp.Mode == ShareWrite && !sp.Mutex.set() {
+					// Same-package shares without a tied mutex are already
+					// checked at the go site by checkGo (the goroutine, the
+					// caller's writes, and every sibling access are all in
+					// this package's function set). Only tied-mutex Facts
+					// need call-site enforcement here.
+					if cal.Pkg == a.pkg && !sp.Mutex.set() {
 						continue
 					}
 					arg := argForSharedParam(c, cal, sp)
@@ -548,7 +551,7 @@ func (a *analyzer) checkShareEvent(callFn *ssa.Function, callInstr ssa.Instructi
 	seen := map[ssa.Instruction]bool{}
 	visiting := map[ssa.Value]bool{}
 	for _, r := range roots {
-		if isChanType(r.val.Type()) || isWhitelistedSync(r.val) || isSyncMutex(r.val) || isConcurrentSafeValue(r.val) {
+		if isChanType(r.val.Type()) || isWhitelistedSync(r.val) || isSyncMutex(r.val) || a.isConcurrentSafeValue(r.val) {
 			continue
 		}
 		for _, acc := range collectDataAccessesDeep(r.val, allFuncs, visiting) {
@@ -562,6 +565,7 @@ func (a *analyzer) checkShareEvent(callFn *ssa.Function, callInstr ssa.Instructi
 			accesses = append(accesses, acc)
 		}
 	}
+	accesses = dropConcurrentSafeFieldAccesses(a.pass, accesses)
 	if len(accesses) == 0 {
 		return
 	}
@@ -582,7 +586,7 @@ func (a *analyzer) checkShareEvent(callFn *ssa.Function, callInstr ssa.Instructi
 	// No Fact-tied mutex: allow if the cascade proves a guard (free-standing,
 	// RWMutex, atomics-only, or partitioned writers) over post-share accesses.
 	for _, r := range roots {
-		if isChanType(r.val.Type()) || isWhitelistedSync(r.val) || isSyncMutex(r.val) || isConcurrentSafeValue(r.val) {
+		if isChanType(r.val.Type()) || isWhitelistedSync(r.val) || isSyncMutex(r.val) || a.isConcurrentSafeValue(r.val) {
 			continue
 		}
 		if accessesGuarded(r.val, accesses, allFuncs) {

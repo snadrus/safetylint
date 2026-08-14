@@ -319,7 +319,7 @@ func (a *analyzer) checkGoCallee(g *ssa.Go, spawner, callee *ssa.Function, globa
 			// Same-object peers only (not same-type): unrelated *T locals must
 			// not poison the lock proof. Pre-go construction stores in the
 			// spawner are before the share and are ignored.
-			if mutexGuardsGoRootsAfter(sameObjectPeersGo(root.val, roots, spawner, g, allFuncs), allFuncs, spawner, g) {
+			if mutexGuardsGoRootsAfter(a.pass, sameObjectPeersGo(root.val, roots, spawner, g, allFuncs), allFuncs, spawner, g) {
 				for _, r := range roots {
 					seen["write:"+typeKey(r.val)] = true
 				}

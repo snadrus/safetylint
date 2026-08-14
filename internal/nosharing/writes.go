@@ -554,7 +554,7 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 
 	callee := c.StaticCallee()
 	if callee != nil {
-		if isConcurrentSafeValue(v) {
+		if isConcurrentSafeValuePass(pass, v) {
 			return false
 		}
 		if isAtomicCallee(callee) {
@@ -602,7 +602,7 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 		return false
 	}
 
-	if isConcurrentSafeValue(v) {
+	if isConcurrentSafeValuePass(pass, v) {
 		return false
 	}
 	// Func values / unknown callees: keep []byte/string as read-only payloads

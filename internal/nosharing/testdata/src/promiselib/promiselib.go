@@ -1,0 +1,48 @@
+package promiselib
+
+import (
+	"context"
+	"sync"
+)
+
+// Promise mirrors Curio's lib/promise: every field access is guarded by mu,
+// so the type derives a ConcurrentSafe Fact.
+type Promise[T any] struct { // want Promise:"concurrentSafe"
+	val  T
+	done chan struct{}
+	mu   sync.Mutex
+}
+
+func (p *Promise[T]) Set(val T) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.val = val
+	if p.done == nil {
+		p.done = make(chan struct{})
+	}
+	close(p.done)
+}
+
+func (p *Promise[T]) Val(ctx context.Context) T {
+	p.mu.Lock()
+	if p.done == nil {
+		p.done = make(chan struct{})
+	}
+	p.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return *new(T)
+	case <-p.done:
+		p.mu.Lock()
+		val := p.val
+		p.mu.Unlock()
+		return val
+	}
+}
+
+func (p *Promise[T]) IsSet() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.done != nil
+}
