@@ -470,9 +470,38 @@ func isStep1Induction(w ssa.Value, g *ssa.Go) bool {
 	}
 	// Range index stored to an Alloc each iteration (Go 1.22+).
 	if u, ok := w.(*ssa.UnOp); ok && u.Op == token.MUL {
-		if _, isAlloc := stripToObject(u.X).(*ssa.Alloc); isAlloc && blockInCycle(u.Block()) {
+		if _, isAlloc := stripToObject(u.X).(*ssa.Alloc); isAlloc {
+			return true
+		}
+	}
+	if _, isAlloc := w.(*ssa.Alloc); isAlloc {
+		return true
+	}
+	// Load of a loop-local int (range index copied to a stack cell).
+	if isLoopLocalInt(w) {
+		return true
+	}
+	return false
+}
+
+func isRangeNext(v ssa.Value) bool {
+	n, ok := v.(*ssa.Next)
+	if ok {
+		return n != nil
+	}
+	if c, ok := v.(*ssa.Call); ok && c.Common() != nil {
+		if b, ok := c.Common().Value.(*ssa.Builtin); ok && b.Name() == "next" {
 			return true
 		}
 	}
 	return false
+}
+
+func isLoopLocalInt(v ssa.Value) bool {
+	u, ok := v.(*ssa.UnOp)
+	if !ok || u.Op != token.MUL || u.Block() == nil || !blockInCycle(u.Block()) {
+		return false
+	}
+	_, isAlloc := stripToObject(u.X).(*ssa.Alloc)
+	return isAlloc
 }

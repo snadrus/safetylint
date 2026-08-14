@@ -37,9 +37,6 @@ func isFrozenFieldAccess(root ssa.Value, acc dataAccess, funcs map[*ssa.Function
 	if st == nil || field < 0 || field >= st.NumFields() {
 		return false
 	}
-	if token.IsExported(st.Field(field).Name()) {
-		return false
-	}
 	return fieldStoresOnlyAtInit(root, field, funcs)
 }
 

@@ -207,10 +207,70 @@ func poolHandoffOK(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Functio
 		}
 		writers[fn] = true
 	}
-	if len(writers) != 1 {
+	if !oneWorkerCluster(writers) {
 		return false
 	}
 	return consistentMutexGuards(handoff, funcs)
+}
+
+// oneWorkerCluster reports that every writer is a single function or a
+// same-package callee of that function (hashChunk called from one worker).
+func oneWorkerCluster(writers map[*ssa.Function]bool) bool {
+	if len(writers) == 0 {
+		return false
+	}
+	if len(writers) == 1 {
+		return true
+	}
+	for w := range writers {
+		if w == nil {
+			continue
+		}
+		reach := callReachable(w)
+		ok := true
+		for o := range writers {
+			if o != w && !reach[o] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+// callReachable is same-package Call/Defer closure (not Go / MakeClosure).
+func callReachable(start *ssa.Function) map[*ssa.Function]bool {
+	seen := map[*ssa.Function]bool{}
+	var work []*ssa.Function
+	add := func(f *ssa.Function) {
+		if f == nil || seen[f] {
+			return
+		}
+		if start != nil && start.Pkg != nil && f.Pkg != nil && f.Pkg != start.Pkg {
+			return
+		}
+		seen[f] = true
+		work = append(work, f)
+	}
+	add(start)
+	for len(work) > 0 {
+		f := work[len(work)-1]
+		work = work[:len(work)-1]
+		for _, b := range f.Blocks {
+			for _, instr := range b.Instrs {
+				switch in := instr.(type) {
+				case *ssa.Call:
+					add(staticCallee(in.Common()))
+				case *ssa.Defer:
+					add(staticCallee(in.Common()))
+				}
+			}
+		}
+	}
+	return seen
 }
 
 func isAppendOf(acc dataAccess, root ssa.Value) bool {

@@ -228,14 +228,15 @@ func roleUsedByGo(g *ssa.Go, root ssa.Value, c *roleContract) (reader, writer bo
 	}
 	// Args that alias root → corresponding params.
 	for i, arg := range g.Common().Args {
-		if !aliasesRoot(arg, root) {
+		if i >= len(cal.Params) {
 			continue
 		}
-		if i < len(cal.Params) {
-			r, w := rolesOnValueIn(cal, cal.Params[i], c)
-			reader = reader || r
-			writer = writer || w
+		if !aliasesRoot(arg, root) && cal.Params[i] != root && !aliasesRoot(cal.Params[i], root) {
+			continue
 		}
+		r, w := rolesOnValueIn(cal, cal.Params[i], c)
+		reader = reader || r
+		writer = writer || w
 	}
 	if mc, ok := g.Common().Value.(*ssa.MakeClosure); ok {
 		cf, _ := mc.Fn.(*ssa.Function)
