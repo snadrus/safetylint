@@ -24,6 +24,50 @@ func (a *analyzer) funcsOnlyCalledBefore(spawner *ssa.Function, g ssa.Instructio
 	return out
 }
 
+// funcsHappensBeforeGo is funcsOnlyCalledBefore but also includes exported
+// functions when every in-package call site happens-before g. Used for
+// AddHandler-style registration that is exported yet occurs before go Run.
+// Exported functions with no in-package sites are excluded (other packages
+// may call them after the share).
+func (a *analyzer) funcsHappensBeforeGo(spawner *ssa.Function, g ssa.Instruction) map[*ssa.Function]bool {
+	out := a.funcsOnlyCalledBefore(spawner, g)
+	if a == nil || spawner == nil || g == nil {
+		return out
+	}
+	sites, goBody, addrTaken := a.callSiteIndex()
+	for _, fn := range a.funcs {
+		if fn == nil || fn == spawner || out[fn] {
+			continue
+		}
+		obj := fn.Object()
+		if obj == nil || !obj.Exported() {
+			continue
+		}
+		if goBody[fn] || addrTaken[fn] {
+			continue
+		}
+		sl := sites[fn]
+		if len(sl) == 0 {
+			continue
+		}
+		ok := true
+		for _, s := range sl {
+			if s.caller == spawner && !s.isDefer && dominatesInstr(s.instr, g) {
+				continue
+			}
+			if out[s.caller] || a.onlyCalledBeforeShare(s.caller, spawner, g, sites, goBody, addrTaken, map[*ssa.Function]int{}) {
+				continue
+			}
+			ok = false
+			break
+		}
+		if ok {
+			out[fn] = true
+		}
+	}
+	return out
+}
+
 // onlyCalledBeforeShare reports that fn cannot run concurrently with the
 // goroutine started at g: it is unexported, not address-taken, not a go
 // body, and every static call dominates g or is in another pre-share helper.

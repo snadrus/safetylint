@@ -177,8 +177,16 @@ func sameObjectPeersGo(focus ssa.Value, roots []sharedRoot, spawner *ssa.Functio
 			for _, p := range paramsReceivingCell(c, funcs) {
 				add(p)
 			}
+			// Method receivers share one SSA Parameter across every *T that
+			// called the method. Chasing Alloc args would merge unrelated
+			// objects (every TaskEngine). Parameter/FreeVar args (dst.WriteMessage)
+			// still connect the method to the caller param; non-method params
+			// (spawn(s *S)) still chase to the concrete Alloc.
 			if !goCalleeParam[c] {
 				for _, x := range argsPassedAs(c, funcs) {
+					if isMethodRecvParam(c) && isDistinctHeapAlloc(x, cells) {
+						continue
+					}
 					add(x)
 					add(stripToObject(x))
 				}
@@ -243,6 +251,27 @@ func sameObjectPeersGo(focus ssa.Value, roots []sharedRoot, spawner *ssa.Functio
 		}
 	}
 	return out
+}
+
+func isMethodRecvParam(v ssa.Value) bool {
+	p, ok := v.(*ssa.Parameter)
+	if !ok || p.Parent() == nil || p.Parent().Signature == nil || p.Parent().Signature.Recv() == nil {
+		return false
+	}
+	params := p.Parent().Params
+	return len(params) > 0 && params[0] == p
+}
+
+func isDistinctHeapAlloc(x ssa.Value, cells map[ssa.Value]bool) bool {
+	obj := stripToObject(x)
+	if obj == nil {
+		return false
+	}
+	if cells[x] || cells[obj] {
+		return false
+	}
+	_, ok := obj.(*ssa.Alloc)
+	return ok
 }
 
 // argsPassedAs returns concrete arguments passed to Parameter cell at call sites.

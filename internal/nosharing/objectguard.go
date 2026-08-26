@@ -42,7 +42,7 @@ func accessesGuarded(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Funct
 	if constIndexPartitionOK(root, accesses) {
 		return true
 	}
-	if rangePartitionOK(root, accesses) {
+	if rangePartitionOK(root, accesses) || affineRangePartitionOK(root, accesses) {
 		return true
 	}
 	if fieldPartitionedGuards(root, accesses, funcs) {
@@ -150,7 +150,7 @@ func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, s
 	if len(dataRoots) > 0 && constIndexPartitionOK(dataRoots[0], accesses) {
 		return true
 	}
-	if len(dataRoots) > 0 && rangePartitionOK(dataRoots[0], accesses) {
+	if len(dataRoots) > 0 && (rangePartitionOK(dataRoots[0], accesses) || affineRangePartitionOK(dataRoots[0], accesses)) {
 		return true
 	}
 	if len(dataRoots) > 0 && fieldPartitionedGuards(dataRoots[0], accesses, funcs) {

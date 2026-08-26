@@ -98,6 +98,7 @@ func TestNosharing(t *testing.T) {
 		"good_init_xpkg_read",
 		"good_context",
 		"good_httpserver",
+		"good_httpclient",
 		"good_stdlib_read",
 		"bad_buffer_write",
 		"good_nolint",
@@ -121,6 +122,14 @@ func TestNosharing(t *testing.T) {
 		"bad_ws_twowriter",
 		"good_promise",
 		"good_wg_readonly",
+		"good_spawn_own",
+		"bad_spawn_own",
+		"good_affine_range",
+		"good_postdom_go",
+		"good_lock_inherit",
+		"good_stack_pool",
+		"good_once_goro",
+		"good_start_gate",
 	)
 }
 

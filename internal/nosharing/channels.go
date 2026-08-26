@@ -119,6 +119,38 @@ func instrIndex(b *ssa.BasicBlock, target ssa.Instruction) int {
 	return -1
 }
 
+// blockPostDominates reports that every path from a hits b (b post-dominates
+// a). Cycles that avoid b fail closed. Used for "conditional write then go".
+func blockPostDominates(b, a *ssa.BasicBlock) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	var walk func(cur *ssa.BasicBlock, stack map[*ssa.BasicBlock]bool) bool
+	walk = func(cur *ssa.BasicBlock, stack map[*ssa.BasicBlock]bool) bool {
+		if cur == b {
+			return true
+		}
+		if stack[cur] {
+			return false
+		}
+		if len(cur.Succs) == 0 {
+			return false
+		}
+		stack[cur] = true
+		for _, s := range cur.Succs {
+			if !walk(s, stack) {
+				return false
+			}
+		}
+		stack[cur] = false
+		return true
+	}
+	return walk(a, map[*ssa.BasicBlock]bool{})
+}
+
 func blockInCycle(b *ssa.BasicBlock) bool {
 	seen := map[*ssa.BasicBlock]bool{}
 	var stack []*ssa.BasicBlock

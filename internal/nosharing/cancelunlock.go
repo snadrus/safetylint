@@ -2,6 +2,7 @@ package nosharing
 
 import (
 	"go/token"
+	"go/types"
 
 	"golang.org/x/tools/go/ssa"
 )
@@ -30,9 +31,15 @@ func isCancelUnlocker(fn *ssa.Function) bool {
 					if isLocalAllocAddr(in.Addr) {
 						continue
 					}
+					if isLockBookkeepingAddr(in.Addr) {
+						continue
+					}
 					return false
 				}
 			case *ssa.MapUpdate:
+				if isLockBookkeepingAddr(in.Map) {
+					continue
+				}
 				return false
 			case *ssa.Call:
 				if cancelUnlockerCallOK(in.Common(), &sawRecv, &sawUnlock) {
@@ -99,13 +106,66 @@ func cancelUnlockerCallOK(c *ssa.CallCommon, sawRecv, sawUnlock *bool) bool {
 		*sawUnlock = true
 		return true
 	}
+	// Builtin delete of the lock map; lock-object unlock helpers.
+	if !c.IsInvoke() {
+		if b, ok := c.Value.(*ssa.Builtin); ok && b.Name() == "delete" {
+			return true
+		}
+	}
 	return false
+}
+
+func isLockBookkeepingAddr(addr ssa.Value) bool {
+	if addr == nil {
+		return false
+	}
+	if fa := fieldAddrOf(addr); fa != nil {
+		st := structOf(fa.X.Type())
+		if st != nil && fa.Field >= 0 && fa.Field < st.NumFields() {
+			switch st.Field(fa.Field).Name() {
+			case "refs", "ref", "Locks", "locks":
+				return true
+			}
+		}
+	}
+	if typeIsMap(addr.Type()) {
+		return true
+	}
+	return false
+}
+
+func typeIsMap(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	t = types.Unalias(t)
+	if p, ok := t.(*types.Pointer); ok {
+		t = types.Unalias(p.Elem())
+	}
+	_, ok := t.Underlying().(*types.Map)
+	return ok
 }
 
 func cancelUnlockerOK(root ssa.Value, fn *ssa.Function) bool {
 	if root == nil || !isCancelUnlocker(fn) {
 		return false
 	}
-	// Fail if the body writes the object (other than unlock).
-	return !isWrittenIn(root, map[*ssa.Function]bool{fn: true}, true)
+	// Bookkeeping writes (refs--, map delete, nested unlock) are allowed.
+	return !hasNonBookkeepingWrite(root, fn)
+}
+
+func hasNonBookkeepingWrite(root ssa.Value, fn *ssa.Function) bool {
+	for _, acc := range collectOwnDataAccesses(root, map[*ssa.Function]bool{fn: true}) {
+		if !acc.write {
+			continue
+		}
+		if isLockBookkeepingAddr(acc.addr) || isMutexFieldAddr(acc.addr) {
+			continue
+		}
+		if isObjectInitStore(acc) {
+			continue
+		}
+		return true
+	}
+	return false
 }

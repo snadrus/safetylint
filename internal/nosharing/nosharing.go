@@ -298,24 +298,34 @@ func (a *analyzer) checkGo(g *ssa.Go, spawner *ssa.Function, globals map[*ssa.Gl
 
 func (a *analyzer) checkGoCallee(instr ssa.Instruction, value ssa.Value, args []ssa.Value, spawner, callee *ssa.Function, globals map[*ssa.Global]bool, reported map[string]bool) {
 	origRoots := collectRoots(value, args, callee, globals)
+	var kept []sharedRoot
+	for _, r := range origRoots {
+		if isChanValueCopy(r.val) {
+			continue
+		}
+		kept = append(kept, r)
+	}
+	origRoots = kept
+	// Alias expansion is spawn-scoped so every *T in the package does not
+	// merge. Access collection still scans the package (allFuncs) so a
+	// later unlocked write of this cell (bad_trylock) is not missed —
+	// but only own fields, and sibling fields this spawn never touches
+	// are filtered (considerWork must not poison keepalive).
 	allFuncs := map[*ssa.Function]bool{}
 	for _, f := range a.funcs {
 		if f != nil {
 			allFuncs[f] = true
 		}
 	}
-	roots := expandRootAliases(origRoots, allFuncs)
-	// Peers of this go's arguments/captures only — not every *T that happens
-	// to flow through the same method in this package.
+	scope := a.spawnShareScope(spawner, callee, instr, origRoots, globals)
+	roots := expandRootAliases(origRoots, scope)
 	thisShare := map[ssa.Value]bool{}
 	for _, o := range origRoots {
 		for _, p := range sameObjectPeersGo(o.val, roots, spawner, instr, allFuncs) {
 			thisShare[p.val] = true
 		}
 	}
-	preShare := a.funcsOnlyCalledBefore(spawner, instr)
-	// Explore the callee's package so cross-package go targets (e.g. s.Run)
-	// still see writes inside the started goroutine.
+	preShare := a.funcsHappensBeforeGo(spawner, instr)
 	reachable := reachableFuncs(callee, callee.Pkg)
 	seen := map[string]bool{}
 
@@ -323,7 +333,7 @@ func (a *analyzer) checkGoCallee(instr ssa.Instruction, value ssa.Value, args []
 		if root.val != nil && len(thisShare) > 0 && !thisShare[root.val] {
 			continue
 		}
-		if isChanType(root.val.Type()) {
+		if isChanType(root.val.Type()) || isChanValueCopy(root.val) {
 			continue
 		}
 		if isWhitelistedSync(root.val) || isSyncMutex(root.val) || isSyncRWMutex(root.val) || isShareSafeStdlib(root.val) || isHarmonyDBType(root.val.Type()) {
@@ -341,8 +351,9 @@ func (a *analyzer) checkGoCallee(instr ssa.Instruction, value ssa.Value, args []
 			continue
 		}
 
+		ctor := allocParentOf(root.val, spawner, instr)
 		writtenInGoro := a.writtenIn(root.val, reachable, true)
-		writtenAfter := isWrittenAfterGo(root.val, spawner, instr, a.funcs, reachable)
+		writtenAfter := isWrittenAfterGoScoped(root.val, spawner, instr, allFuncs, reachable, ctor)
 		// Struct/array value snapshots captured into a goroutine and only
 		// read there: ignore spawner reassignment of the capture cell
 		// (loop-local map lookups under a lock, Go 1.22+ per-iteration vars).
@@ -361,10 +372,16 @@ func (a *analyzer) checkGoCallee(instr ssa.Instruction, value ssa.Value, args []
 		if (writtenInGoro || writtenAfter) && waitGroupMutexOK(root.val, spawner, instr, reachable) {
 			continue
 		}
-		if cancelUnlockerOK(root.val, callee) && !writtenInGoro {
+		if cancelUnlockerOK(root.val, callee) {
 			continue
 		}
 		if bufferPoolCheckoutOK(root.val, spawner, instr, reachable) {
+			continue
+		}
+		if lockedStackCheckoutOK(root.val, spawner, instr, reachable) {
+			continue
+		}
+		if singleGoroOwnOK(root.val, spawner, instr, reachable, allFuncs, ctor, preShare) {
 			continue
 		}
 		if websocketPairOK(sameObjectPeersGo(root.val, roots, spawner, instr, allFuncs), spawner, instr, reachable) {
@@ -374,16 +391,16 @@ func (a *analyzer) checkGoCallee(instr ssa.Instruction, value ssa.Value, args []
 		if writtenInGoro || writtenAfter {
 			// Atomics-only first on this root alone (denylist Filter): peer
 			// unions must not demand a mutex for pure atomic.Pointer cells.
-			if atomicsOnlyAccesses(collectDataAccessesDeep(root.val, allFuncs, map[ssa.Value]bool{})) {
+			if atomicsOnlyAccesses(collectOwnDataAccessesDeep(root.val, allFuncs, map[ssa.Value]bool{})) {
 				for _, r := range roots {
 					seen["write:"+typeKey(r.val)] = true
 				}
 				continue
 			}
-			// Same-object peers only (not same-type): unrelated *T locals must
-			// not poison the lock proof. Pre-go construction / init-helper
-			// stores are before the share and are ignored.
-			if mutexGuardsGoRootsAfter(sameObjectPeersGo(root.val, roots, spawner, instr, allFuncs), allFuncs, spawner, instr, preShare) {
+			// Same-object peers only (not same-type). Own-field accesses;
+			// constructor / pre-go stores and other-field sibling writes ignored.
+			peers := sameObjectPeersGo(root.val, roots, spawner, instr, allFuncs)
+			if objectGuardedOwnRootsAfter(peers, allFuncs, spawner, instr, preShare, reachable) {
 				for _, r := range roots {
 					seen["write:"+typeKey(r.val)] = true
 				}

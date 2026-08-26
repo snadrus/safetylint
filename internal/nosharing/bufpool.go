@@ -345,7 +345,10 @@ func indexUsesToken(addr, idx ssa.Value) bool {
 		case *ssa.FieldAddr:
 			cur = v.X
 		case *ssa.Slice:
-			return tokenValue(v.Low, idx) || tokenValue(v.High, idx)
+			if tokenValue(v.Low, idx) || tokenValue(v.High, idx) {
+				return true
+			}
+			cur = v.X // tbufs[idx][:] — token is the IndexAddr, not the slice bounds
 		default:
 			return false
 		}

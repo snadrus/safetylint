@@ -3,6 +3,7 @@ package nosharing
 import (
 	"go/token"
 	"go/types"
+	"sync"
 
 	"golang.org/x/tools/go/ssa"
 )
@@ -62,6 +63,9 @@ func findStructuralGuardsKind(root ssa.Value, rw bool) []structuralGuard {
 
 	if st := structOf(root.Type()); st != nil {
 		addEmbeddedMutexes(st, fieldsOf, add)
+		if !rw {
+			addCondLockerFields(st, add)
+		}
 	}
 
 	for cur := root; cur != nil; {
@@ -81,6 +85,9 @@ func findStructuralGuardsKind(root ssa.Value, rw bool) []structuralGuard {
 		case *ssa.FieldAddr:
 			if st := structOf(v.X.Type()); st != nil {
 				addEmbeddedMutexes(st, fieldsOf, add)
+				if !rw {
+					addCondLockerFields(st, add)
+				}
 			}
 			cur = v.X
 		case *ssa.IndexAddr, *ssa.Slice:
@@ -467,6 +474,34 @@ func addEmbeddedMutexes(st *types.Struct, fieldsOf func(*types.Struct) []int, ad
 	}
 }
 
+// addCondLockerFields treats pointer fields whose element has a sync.Locker
+// field (ctxCond.L) as a tied mutex of the parent (sectorLock.cond).
+func addCondLockerFields(st *types.Struct, add func(types.Type, int)) {
+	if st == nil {
+		return
+	}
+	for i := 0; i < st.NumFields(); i++ {
+		f := st.Field(i)
+		if f == nil {
+			continue
+		}
+		elem := types.Unalias(f.Type())
+		if p, ok := elem.(*types.Pointer); ok {
+			elem = types.Unalias(p.Elem())
+		}
+		inner := structOf(elem)
+		if inner == nil {
+			continue
+		}
+		for j := 0; j < inner.NumFields(); j++ {
+			if isLockerFieldType(inner.Field(j).Type()) {
+				add(st, i)
+				break
+			}
+		}
+	}
+}
+
 func modeOKForAccess(mode holdMode, write, rw bool) bool {
 	if write {
 		return mode == holdWrite
@@ -543,6 +578,8 @@ func analyzeMustHold(fn *ssa.Function) map[ssa.Instruction]holdSet {
 	// model that hold on entry so bookkeeping under the critical section
 	// (before the inner Unlock) is recognized.
 	if init := wrapperEntryHold(fn); init != nil {
+		blockIn[entry.Index] = init
+	} else if init := inheritedEntryHold(fn); init != nil {
 		blockIn[entry.Index] = init
 	} else {
 		blockIn[entry.Index] = holdSet{}
@@ -904,6 +941,10 @@ func lockUnlockGuard(c *ssa.CallCommon) (guardKey, bool) {
 	if recv == nil {
 		return guardKey{}, false
 	}
+	recv = peelToMutexRecv(recv)
+	if g, ok := lockerFieldGuard(recv, name); ok {
+		return g, true
+	}
 	if fa, ok := recv.(*ssa.FieldAddr); ok {
 		isMu := isNamedSyncType(fa.Type(), "Mutex")
 		isRW := isNamedSyncType(fa.Type(), "RWMutex")
@@ -1015,6 +1056,197 @@ func wrapperEntryHold(fn *ssa.Function) holdSet {
 		mode = holdRead
 	}
 	return holdSet{guardKey{base: fn.Params[0], field: field}: mode}
+}
+
+var (
+	inheritHoldMu       sync.Mutex
+	inheritHoldVisiting = map[*ssa.Function]bool{}
+)
+
+// inheritedEntryHold returns the must-held set at entry to an unexported
+// helper when every static call is dominated by Lock without Unlock
+// (cleanupIPLocked called only from methods that already hold t.mu).
+func inheritedEntryHold(fn *ssa.Function) holdSet {
+	if fn == nil || len(fn.Blocks) == 0 || fn.Pkg == nil {
+		return nil
+	}
+	if obj := fn.Object(); obj != nil && obj.Exported() {
+		return nil
+	}
+	inheritHoldMu.Lock()
+	if inheritHoldVisiting[fn] {
+		inheritHoldMu.Unlock()
+		return nil
+	}
+	inheritHoldVisiting[fn] = true
+	inheritHoldMu.Unlock()
+	defer func() {
+		inheritHoldMu.Lock()
+		delete(inheritHoldVisiting, fn)
+		inheritHoldMu.Unlock()
+	}()
+
+	var common holdSet
+	saw := false
+	for _, caller := range packageFunctions(fn.Pkg) {
+		if caller == nil || caller == fn {
+			continue
+		}
+		for _, b := range caller.Blocks {
+			for _, instr := range b.Instrs {
+				call, ok := instr.(*ssa.Call)
+				if !ok {
+					continue
+				}
+				if call.Common().StaticCallee() != fn {
+					continue
+				}
+				held := analyzeMustHold(caller)[instr]
+				if held == nil || len(held) == 0 {
+					return nil
+				}
+				if !saw {
+					common = cloneGuardSet(held)
+					saw = true
+					continue
+				}
+				common = intersectGuards(common, held)
+				if len(common) == 0 {
+					return nil
+				}
+			}
+		}
+	}
+	if !saw || len(common) == 0 {
+		return nil
+	}
+	return common
+}
+
+func packageFunctions(pkg *ssa.Package) []*ssa.Function {
+	if pkg == nil {
+		return nil
+	}
+	seen := map[*ssa.Function]bool{}
+	var out []*ssa.Function
+	var add func(f *ssa.Function)
+	add = func(f *ssa.Function) {
+		if f == nil || seen[f] {
+			return
+		}
+		seen[f] = true
+		out = append(out, f)
+		for _, a := range f.AnonFuncs {
+			add(a)
+		}
+	}
+	for _, m := range pkg.Members {
+		switch x := m.(type) {
+		case *ssa.Function:
+			add(x)
+		case *ssa.Type:
+			if x.Type() == nil {
+				continue
+			}
+			if named, ok := x.Type().(*types.Named); ok {
+				for i := 0; i < named.NumMethods(); i++ {
+					if fn := pkg.Prog.FuncValue(named.Method(i)); fn != nil {
+						add(fn)
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+func peelToMutexRecv(v ssa.Value) ssa.Value {
+	for v != nil {
+		switch x := v.(type) {
+		case *ssa.UnOp:
+			if x.Op == token.MUL {
+				v = x.X
+				continue
+			}
+			return v
+		case *ssa.ChangeType:
+			v = x.X
+		case *ssa.ChangeInterface:
+			v = x.X
+		case *ssa.MakeInterface:
+			v = x.X
+		case *ssa.Convert:
+			v = x.X
+		default:
+			return v
+		}
+	}
+	return v
+}
+
+// lockerFieldGuard recognizes obj.cond.L.Lock() where L is a sync.Locker
+// field. The guard identity is the parent object's pointer field (cond),
+// so r/w of the container are tied to that nested mutex.
+func lockerFieldGuard(recv ssa.Value, name string) (guardKey, bool) {
+	switch name {
+	case "Lock", "Unlock", "TryLock":
+	default:
+		return guardKey{}, false
+	}
+	fa, ok := recv.(*ssa.FieldAddr)
+	if !ok || !isLockerFieldType(fa.Type()) {
+		return guardKey{}, false
+	}
+	// l.cond.L → FieldAddr L of (load of FieldAddr cond of l)
+	cur := fa.X
+	if u, ok := cur.(*ssa.UnOp); ok && u.Op == token.MUL {
+		cur = u.X
+	}
+	if parentFA, ok := cur.(*ssa.FieldAddr); ok {
+		return guardKey{base: mutexContainer(parentFA.X), field: parentFA.Field}, true
+	}
+	return guardKey{base: mutexContainer(fa.X), field: fa.Field}, true
+}
+
+func isLockerFieldType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	if isNamedSyncType(t, "Mutex", "RWMutex") {
+		return false
+	}
+	t = types.Unalias(t)
+	n, ok := t.(*types.Named)
+	if !ok {
+		iface, ok := t.Underlying().(*types.Interface)
+		if !ok {
+			return false
+		}
+		return interfaceHasLockUnlock(iface)
+	}
+	if n.Obj() != nil && n.Obj().Pkg() != nil && n.Obj().Pkg().Path() == "sync" && n.Obj().Name() == "Locker" {
+		return true
+	}
+	if iface, ok := n.Underlying().(*types.Interface); ok {
+		return interfaceHasLockUnlock(iface)
+	}
+	return false
+}
+
+func interfaceHasLockUnlock(iface *types.Interface) bool {
+	if iface == nil {
+		return false
+	}
+	hasLock, hasUnlock := false, false
+	for i := 0; i < iface.NumMethods(); i++ {
+		switch iface.Method(i).Name() {
+		case "Lock":
+			hasLock = true
+		case "Unlock":
+			hasUnlock = true
+		}
+	}
+	return hasLock && hasUnlock
 }
 
 // wrapperLockGuard recognizes user methods named Lock/Unlock/RLock/RUnlock

@@ -210,6 +210,9 @@ func hasWriteNotBefore(root ssa.Value, fn *ssa.Function, g ssa.Instruction) bool
 				if b != goBlock && b.Dominates(goBlock) && !blockInCycle(b) {
 					continue
 				}
+				if b != goBlock && blockPostDominates(goBlock, b) && !blockInCycle(b) && !blockInCycle(goBlock) {
+					continue
+				}
 				return true
 			}
 		}
@@ -236,6 +239,11 @@ func hasWriteNotBefore(root ssa.Value, fn *ssa.Function, g ssa.Instruction) bool
 			}
 			if rb != goBlock && rb.Dominates(goBlock) && !blockInCycle(rb) {
 				continue // dominates go and not in a loop
+			}
+			// Conditional wait=… then go: the go block post-dominates the
+			// write, so the store happens-before the spawn (value capture).
+			if rb != goBlock && blockPostDominates(goBlock, rb) && !blockInCycle(rb) && !blockInCycle(goBlock) {
+				continue
 			}
 			return true
 		}
@@ -668,7 +676,7 @@ func isShareSafeStdlib(v ssa.Value) bool {
 	if v == nil {
 		return false
 	}
-	return isContextType(v.Type()) || isHTTPServerType(v.Type()) || isHarmonyDBType(v.Type())
+	return isContextType(v.Type()) || isHTTPServerType(v.Type()) || isHTTPClientType(v.Type()) || isHarmonyDBType(v.Type())
 }
 
 func isHarmonyDBType(t types.Type) bool {
@@ -735,6 +743,23 @@ func isHTTPServerType(t types.Type) bool {
 	}
 	obj := n.Obj()
 	return obj != nil && obj.Pkg() != nil && obj.Pkg().Path() == "net/http" && obj.Name() == "Server"
+}
+
+func isHTTPClientType(t types.Type) bool {
+	t = types.Unalias(t)
+	for {
+		p, ok := t.(*types.Pointer)
+		if !ok {
+			break
+		}
+		t = types.Unalias(p.Elem())
+	}
+	n, ok := t.(*types.Named)
+	if !ok {
+		return false
+	}
+	obj := n.Obj()
+	return obj != nil && obj.Pkg() != nil && obj.Pkg().Path() == "net/http" && obj.Name() == "Client"
 }
 
 func isMutexLike(v ssa.Value) bool {
