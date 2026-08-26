@@ -12,7 +12,7 @@ import (
 
 // MaxVerifiedGo is the newest Go toolchain whose standard library this
 // tool's curated spawn/async/share model is known to cover.
-const MaxVerifiedGo = "go1.26.5"
+const MaxVerifiedGo = "go1.26.7"
 
 var warnOnce sync.Once
 

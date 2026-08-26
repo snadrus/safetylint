@@ -20,7 +20,7 @@ func (a *analyzer) exportParamWriteFacts() {
 			continue
 		}
 		fact := a.computeWritesParams(fn)
-		a.pass.ExportObjectFact(obj, fact)
+		a.exportObjectFact(obj, fact)
 	}
 }
 
@@ -49,7 +49,7 @@ func (a *analyzer) computeWritesParams(fn *ssa.Function) *WritesParams {
 // writesParamsFact reports whether a WritesParams Fact answers whether c
 // writes through v. known=false means no Fact (stay pessimistic).
 func writesParamsFact(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value) (known, writes bool) {
-	if pass == nil || c == nil || v == nil {
+	if pass == nil || c == nil || v == nil || !factsEnabled() {
 		return false, false
 	}
 	callee := c.StaticCallee()

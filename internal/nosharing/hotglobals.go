@@ -18,9 +18,9 @@ func (a *analyzer) exportHotGlobals() {
 	a.initConcurrent = a.computeInitConcurrent()
 	hot := a.collectInitHotGlobals()
 	a.localHot = hot
-	if a.pass != nil && len(hot.Globals) > 0 {
+	if len(hot.Globals) > 0 {
 		cp := *hot
-		a.pass.ExportPackageFact(&cp)
+		a.exportPackageFact(&cp)
 	}
 }
 

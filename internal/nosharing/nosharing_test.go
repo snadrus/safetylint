@@ -83,6 +83,9 @@ func TestNosharing(t *testing.T) {
 		"bad_xpkg_wrap",
 		"good_xpkg_mutex",
 		"bad_afterfunc",
+		"bad_afterfunc_callback",
+		"good_afterfunc",
+		"good_afterfunc_mutex",
 		"bad_handlefunc",
 		"bad_initgo",
 		"good_initgo",
@@ -95,5 +98,44 @@ func TestNosharing(t *testing.T) {
 		"good_init_xpkg_read",
 		"good_context",
 		"good_httpserver",
+		"good_stdlib_read",
+		"bad_buffer_write",
+		"good_nolint",
+		"bad_nolint_nounsafe",
+		"good_initshare_locked",
+		"good_initshare_atomic",
+		"good_initshare_chan",
+		"bad_initshare_write",
+		"good_frozen_field",
+		"bad_frozen_field",
+		"good_iface_arg",
+		"bad_iface_arg",
+		"good_field_mutex",
+		"bad_field_mutex",
+		"good_cancel_unlock",
+		"bad_cancel_unlock",
+		"good_bufpool",
+		"good_range_part",
+		"bad_range_part",
+		"good_ws_proxy",
+		"bad_ws_twowriter",
+		"good_promise",
+		"good_wg_readonly",
+	)
+}
+
+func TestNosharingNoFactsLocalReg(t *testing.T) {
+	t.Setenv("SAFETYLINT_NO_FACTS", "1")
+	testdata := analysistest.TestData()
+	analysistest.Run(t, testdata, nosharing.Analyzer, "good_localreg")
+}
+
+func TestNosharingNoFactsResiduals(t *testing.T) {
+	t.Setenv("SAFETYLINT_NO_FACTS", "1")
+	testdata := analysistest.TestData()
+	analysistest.Run(t, testdata, nosharing.Analyzer,
+		"good_iface_arg",
+		"good_wg_readonly",
+		"good_range_part",
 	)
 }

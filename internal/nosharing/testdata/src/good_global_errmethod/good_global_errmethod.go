@@ -1,10 +1,16 @@
 package good_global_errmethod
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 var ErrX = fmt.Errorf("x")
 
 func Run() string {
 	go func() {}()
-	return ErrX.Error()
+	if errors.Is(ErrX, ErrX) {
+		return ErrX.Error()
+	}
+	return ""
 }

@@ -35,6 +35,10 @@ binary (comma- or space-separated). Example matching Curio’s `make curio-pdp`
 
 Exit status is non-zero if any diagnostic is reported (via `multichecker`).
 
+`//nolint:safetylint // reason` on the diagnostic line (or the line
+immediately above) suppresses that finding. Use `//nolint:nosharing` or
+`//nolint:nounsafe` to target one analyzer.
+
 ## What it proves
 
 When safetylint accepts a package, the following hold (soundness: when in
@@ -61,13 +65,25 @@ doubt, it **rejects**):
      3. **`sync.RWMutex` discipline** (tied or free-standing): every write
         under `Lock`, every read under `Lock` or `RLock`;
      4. **atomics-only** concurrent touches (`sync/atomic`);
-     5. **const-index partitioned** slice/array writers (disjoint indexes,
-        no concurrent reads / header mutation).
-     Different mutex fields of the same struct are not interchangeable.
+     5. **const-index or disjoint-range partitioned** slice/array writers
+        (no concurrent reads / header mutation);
+     6. **field-partitioned mutexes**: each field of a shared object / global
+        may have its own consistent mutex (wrapper `Lock`/`Unlock` count).
+     Unlocked reads of fields **never written after construction / first-share**
+     do not poison the proof (mutex/atomic/channel still required for mutable
+     fields). Different mutexes protecting the **same** field are not
+     interchangeable.
      Writes through separately heap-allocated objects reached only via
      pointer fields of the shared value do not count as writing that value
      (e.g. `cfg.DB.Query` does not write `*Cfg`); module-cache callees export
      `WritesParams` Facts so third-party pointer calls can be evaluated.
+     Passing `*T` into an interface method is not a write of `*T` unless the
+     method name looks like a setter. `Pad(src, dst)`-style helpers do not
+     write `src`.
+     Sharing a heap object after init is allowed when later use only does
+     share-safe things internally (tied mutex, atomics, channels); a method
+     call is not a write of that object if the method does not write the
+     receiver except under its mutex / via atomics / channels.
    - **InitOnly** registration helpers (package-level **map/slice** globals only,
      no spawn, init-only callers) may write those tables; importers must call
      them only from `init` / var initializers (`var _ = Reg(…)`).
@@ -77,6 +93,11 @@ doubt, it **rejects**):
    - Dynamic `go fn(…)` is allowed when every same-package assignment to `fn`
      is a known local function/closure through **unexported** paths; exported
      setters/params cannot complete the set. Otherwise it is refused.
+   - A goroutine that only waits on `ctx.Done` and unlocks is not a write of
+     the shared object. Websocket-style pairs (one reader + one writer per
+     conn) are accepted; two writers still fail. A channel-token buffer-pool
+     checkout (`idx := <-throttle`; exclusive `bufs[idx]`; return token) is
+     exclusive use.
    - **WaitGroup fan-out/join**: result locals written by one worker (or
      read-only during the fan-out) with `Wait` before the parent uses them;
      a writing worker may not share the cell with a sibling reader/writer.
@@ -110,8 +131,10 @@ doubt, it **rejects**):
    **reads stay legal**, and writes are refused unless the guard cascade
    proves a lock/atomic/partition (including a free-standing package mutex
    held at every touch), a fully Once-synchronized global, or an **InitOnly**
-   registry helper (`InitOnly` Fact on exported map/slice writers that only
-   mutate their receiver and are called only from init/`var`/pre-spawn).
+   registry helper (exported map/slice writers that only mutate their table
+   and are called only from init/`var`/pre-spawn). Same-package discovery
+   does not need Facts (`SAFETYLINT_NO_FACTS=1`); cross-package callers
+   still import the `InitOnly` Fact.
 
    Soft value-copy API writes (`time.Time` methods and curated packages such
    as `golang.org/x/sync/singleflight`) do not count as shared-memory
@@ -128,12 +151,17 @@ doubt, it **rejects**):
    Facts (mode `read`/`write`, optional tied mutex). Call sites are synthetic
    share events: post-call writes are refused unless under the Fact's tied
    `sync.Mutex`. Wrappers re-export Facts from callees. Stdlib / GOROOT
-   packages are not Fact-analyzed (treated as unknown: no assumed retention;
-   curated Serve/Listen APIs remain freeze spawn points).
+   packages are not Fact-analyzed and are not SSA-scanned. GOROOT calls are
+   not writes unless listed in a short `curatedWriters` table (`Buffer.Write`,
+   `sort.Slice`, …). Stdlib APIs that keep a pointer after return are listed
+   in `curatedRetains` (ListenAndServe/`Serve` keep `*Server` / Listener /
+   Handler; `signal.Notify` keeps the channel). Curated Serve/Listen APIs
+   remain freeze spawn points.
 
    Curated async stdlib APIs (`time.AfterFunc`, `http.HandleFunc` / `Handle`,
-   `os/signal.NotifyFunc`) treat callback closures as share events on their
-   captures.
+   `os/signal.NotifyFunc`) spawn the callback like `go`: the body is analyzed
+   as a goroutine, and passing the closure does not drop the caller's mutex
+   hold.
 
    If **init** starts concurrency, `main` and other non-init code are already
    post-spawn for global freeze. Globals touched by init-time goroutines are
@@ -195,9 +223,11 @@ safetylint prefers false rejections over missed races:
   pessimistically for argument writes. Fact-less cross-package calls do
   **not** end the global-write phase; `go`, dynamic/interface calls,
   Fact-bearing spawners, and curated Serve/Listen/async APIs do.
-- Stdlib / GOROOT packages are skipped for Fact export; curated async APIs
-  (`time.AfterFunc`, `http.HandleFunc`, …) still share callback captures.
-  Other hidden stdlib spawn+retain APIs remain a limitation until listed.
+- Stdlib / GOROOT packages are skipped for Fact export and not SSA-scanned.
+  Bodyless GOROOT calls are not writes unless listed in `curatedWriters`.
+  Pointer retention uses `curatedRetains` (ListenAndServe/`Serve`,
+  `signal.Notify`, …). AfterFunc / HandleFunc callback slots are spawns, not
+  retains. Hidden stdlib spawn+retain APIs remain a limitation until listed.
   Running on a Go toolchain newer than this tool's verified version warns
   that faults via new standard funcs may be possible.
 - Exported functions in library packages may never write plain globals once

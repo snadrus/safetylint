@@ -61,9 +61,7 @@ func findStructuralGuardsKind(root ssa.Value, rw bool) []structuralGuard {
 	}
 
 	if st := structOf(root.Type()); st != nil {
-		for _, fi := range fieldsOf(st) {
-			add(st, fi)
-		}
+		addEmbeddedMutexes(st, fieldsOf, add)
 	}
 
 	for cur := root; cur != nil; {
@@ -82,9 +80,7 @@ func findStructuralGuardsKind(root ssa.Value, rw bool) []structuralGuard {
 			continue
 		case *ssa.FieldAddr:
 			if st := structOf(v.X.Type()); st != nil {
-				for _, fi := range fieldsOf(st) {
-					add(st, fi)
-				}
+				addEmbeddedMutexes(st, fieldsOf, add)
 			}
 			cur = v.X
 		case *ssa.IndexAddr, *ssa.Slice:
@@ -108,6 +104,17 @@ func mutexGuardsGoRoots(roots []sharedRoot, funcs map[*ssa.Function]bool) bool {
 // funcs is covered by the north-star guard cascade.
 func mutexGuardsAccesses(root ssa.Value, funcs map[*ssa.Function]bool) bool {
 	return objectGuarded(root, funcs)
+}
+
+// mutexGuardsGlobal is mutexGuardsAccesses for package globals: init-wrapper
+// stores (composite literals / map setup) are dropped so a later per-field
+// mutex proof is not poisoned. Different fields may use different mutexes.
+func mutexGuardsGlobal(root ssa.Value, funcs map[*ssa.Function]bool) bool {
+	if root == nil {
+		return true
+	}
+	accesses := dropInitFuncAccesses(collectDataAccessesDeep(root, funcs, map[ssa.Value]bool{}))
+	return accessesGuarded(root, accesses, funcs)
 }
 
 // hasTiedMutex reports whether there exists one structural mutex field that
@@ -265,6 +272,25 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 			}
 		}
 		if cal := c.StaticCallee(); cal != nil {
+			if isDBClientCallee(cal) || (cal.Signature != nil && cal.Signature.Recv() != nil && isHarmonyDBType(cal.Signature.Recv().Type())) {
+				for _, arg := range c.Args {
+					if derived[arg] && !isMutexFieldAddr(arg) {
+						add(instr, arg, false)
+						return
+					}
+				}
+				return
+			}
+			if isSrcFirstSliceCopy(cal) {
+				first := firstSliceArgIndex(c)
+				for i, arg := range c.Args {
+					if derived[arg] && !isMutexFieldAddr(arg) {
+						add(instr, arg, i != first && i >= 0)
+						return
+					}
+				}
+				return
+			}
 			if isWhitelistedSyncMethod(cal, recvOfCall(c)) || isRWMutexMethod(cal) || isSyncMutexMethod(cal) {
 				return
 			}
@@ -277,10 +303,20 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 				}
 				return
 			}
-			if isAtomicCallee(cal) || (cal.Signature.Recv() != nil && isAtomicValueType(cal.Signature.Recv().Type())) {
+			if isAtomicCallee(cal) || isAtomicSyncMethod(cal, recvOfCall(c)) {
 				for _, arg := range c.Args {
 					if derived[arg] && !isMutexFieldAddr(arg) {
-						add(instr, arg, true)
+						add(instr, arg, false) // sync/atomic is synchronization
+						return
+					}
+				}
+				return
+			}
+			if calleeInGOROOT(cal) {
+				write := isCuratedWriter(cal)
+				for _, arg := range c.Args {
+					if derived[arg] && !isMutexFieldAddr(arg) {
+						add(instr, arg, write)
 						return
 					}
 				}
@@ -299,12 +335,17 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 					add(instr, arg, false)
 					return
 				}
+				if c.IsInvoke() && !invokeLooksLikeSetter(c) {
+					// Passing *T into an interface method is not a field write.
+					return
+				}
 				add(instr, arg, true)
 				return
 			}
 		}
+		// Interface invoke does not mutate the iface value (err.Error, ctx.Done).
 		if c.IsInvoke() && derived[c.Value] {
-			add(instr, c.Value, true)
+			add(instr, c.Value, false)
 		}
 	}
 
@@ -321,6 +362,13 @@ func collectDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []dataAcc
 					}
 				case *ssa.UnOp:
 					if in.Op == token.MUL && derived[in.X] {
+						// Loading a captured *T (FreeVar/Alloc of **T) to
+						// reach fields or Lock is pointer identity, not a
+						// field access. The load of e in e.mu.Lock() happens
+						// before the acquire and must not fail the proof.
+						if isReceiverPointerLoad(in) {
+							continue
+						}
 						add(in, in.X, false)
 					}
 				case *ssa.MapUpdate:
@@ -364,11 +412,59 @@ func accessProtectedBy(acc dataAccess, held holdSet, tied structuralGuard) bool 
 		if !modeOKForAccess(mode, acc.write, tied.rw) {
 			continue
 		}
-		if baseCoversAddr(g.base, acc.addr) {
+		if baseCoversAddr(g.base, acc.addr) || sameGuardObject(g.base, acc.addr) {
 			return true
 		}
 	}
 	return false
+}
+
+func sameGuardObject(base, addr ssa.Value) bool {
+	if base == nil || addr == nil {
+		return false
+	}
+	ob, oa := stripToObject(base), stripToObject(addr)
+	return ob != nil && ob == oa
+}
+
+// mutexContainer peels pointer loads but not FieldAddr, so a mutex in an
+// embedded struct keeps a distinct guard identity from the outer object.
+func mutexContainer(v ssa.Value) ssa.Value {
+	for v != nil {
+		switch x := v.(type) {
+		case *ssa.UnOp:
+			if x.Op == token.MUL {
+				v = x.X
+				continue
+			}
+			return v
+		case *ssa.ChangeType:
+			v = x.X
+		case *ssa.Convert:
+			v = x.X
+		default:
+			return v
+		}
+	}
+	return v
+}
+
+func addEmbeddedMutexes(st *types.Struct, fieldsOf func(*types.Struct) []int, add func(types.Type, int)) {
+	if st == nil {
+		return
+	}
+	for _, fi := range fieldsOf(st) {
+		add(st, fi)
+	}
+	for i := 0; i < st.NumFields(); i++ {
+		f := st.Field(i)
+		if f == nil || !f.Embedded() {
+			continue
+		}
+		if inner := structOf(f.Type()); inner != nil && inner != st {
+			addEmbeddedMutexes(inner, fieldsOf, add)
+		}
+	}
 }
 
 func modeOKForAccess(mode holdMode, write, rw bool) bool {
@@ -660,6 +756,12 @@ func applyCallHold(held holdSet, c *ssa.CallCommon, isDefer bool, universe holdS
 			isWhitelistedSyncMethod(callee, recvOfCall(c)) {
 			return
 		}
+		// AfterFunc / HandleFunc / NotifyFunc spawn the callback like `go`.
+		// Passing the closure (which may capture a held mutex) must not end
+		// the caller's held-lock region.
+		if isAsyncCallbackCallee(callee) {
+			return
+		}
 	}
 	for _, arg := range c.Args {
 		killEscaping(held, arg)
@@ -736,6 +838,10 @@ func calleeMayUnlock(fn *ssa.Function, g guardKey, visited map[*ssa.Function]boo
 			if cal == nil {
 				return true
 			}
+			if isAsyncCallbackCallee(cal) {
+				// Spawn of the callback, not an unlock or mutex escape.
+				continue
+			}
 			if len(cal.Blocks) > 0 {
 				if calleeMayUnlock(cal, g, visited) {
 					return true
@@ -807,7 +913,10 @@ func lockUnlockGuard(c *ssa.CallCommon) (guardKey, bool) {
 		if isMu && (name == "RLock" || name == "RUnlock" || name == "TryRLock") {
 			return guardKey{}, false
 		}
-		return guardKey{base: stripToObject(fa.X), field: fa.Field}, true
+		// Keep the immediate containing struct (do not strip FieldAddr):
+		// embedded mutexes would otherwise share the root's field 0 with
+		// the outer RWMutex (dynamicLocker.cdmx vs RWMutex).
+		return guardKey{base: mutexContainer(fa.X), field: fa.Field}, true
 	}
 	// Free-standing Mutex / *Mutex / RWMutex / *RWMutex: package Global or
 	// stack/heap Alloc (fan-out local locks under WaitGroup). Closure FreeVars
@@ -1130,6 +1239,15 @@ func isMutexGuardCall(c *ssa.CallCommon) bool {
 	return ok
 }
 
+// isReceiverPointerLoad reports *p where p holds a *Struct (typical SSA
+// capture of a receiver / heap object pointer).
+func isReceiverPointerLoad(u *ssa.UnOp) bool {
+	if u == nil || u.Op != token.MUL {
+		return false
+	}
+	return structOf(u.Type()) != nil && typeIsIndirect(u.Type())
+}
+
 func isMutexFieldAddr(v ssa.Value) bool {
 	fa, ok := v.(*ssa.FieldAddr)
 	if !ok {
@@ -1186,7 +1304,13 @@ func stripToObject(v ssa.Value) ssa.Value {
 
 func structOf(t types.Type) *types.Struct {
 	t = types.Unalias(t)
-	if p, ok := t.(*types.Pointer); ok {
+	// Closure captures of *T are typically **T (heap cell). Peel every
+	// pointer so a tied mutex field of T is still visible.
+	for {
+		p, ok := t.(*types.Pointer)
+		if !ok {
+			break
+		}
 		t = types.Unalias(p.Elem())
 	}
 	switch t := t.(type) {

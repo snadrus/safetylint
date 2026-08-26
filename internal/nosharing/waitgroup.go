@@ -11,7 +11,7 @@ import (
 // When a worker writes the root, no sibling goroutine may read or write it
 // (concurrent read+write is a race even if Wait joins the writer). Read-only
 // fan-out (no worker writers) still allows sibling readers.
-func waitGroupExclusiveOK(root ssa.Value, spawner *ssa.Function, g *ssa.Go, goro map[*ssa.Function]bool) bool {
+func waitGroupExclusiveOK(root ssa.Value, spawner *ssa.Function, g ssa.Instruction, goro map[*ssa.Function]bool) bool {
 	if root == nil || spawner == nil || g == nil {
 		return false
 	}
@@ -70,7 +70,7 @@ func waitGroupExclusiveOK(root ssa.Value, spawner *ssa.Function, g *ssa.Go, goro
 // may run concurrent with workers is covered by one free-standing Mutex/RWMutex
 // (package Global or stack Alloc). Post-Wait spawner accesses are exclusive and
 // need not hold the lock. Multiple workers may write the same cell under the lock.
-func waitGroupMutexOK(root ssa.Value, spawner *ssa.Function, g *ssa.Go, goro map[*ssa.Function]bool) bool {
+func waitGroupMutexOK(root ssa.Value, spawner *ssa.Function, g ssa.Instruction, goro map[*ssa.Function]bool) bool {
 	if root == nil || spawner == nil || g == nil {
 		return false
 	}
@@ -96,7 +96,7 @@ func waitGroupMutexOK(root ssa.Value, spawner *ssa.Function, g *ssa.Go, goro map
 	return freeStandingMutexGuards(accesses, conc, true)
 }
 
-func fanoutConcurrentAccesses(root ssa.Value, spawner *ssa.Function, g *ssa.Go, wait ssa.Instruction, conc map[*ssa.Function]bool) []dataAccess {
+func fanoutConcurrentAccesses(root ssa.Value, spawner *ssa.Function, g ssa.Instruction, wait ssa.Instruction, conc map[*ssa.Function]bool) []dataAccess {
 	var accesses []dataAccess
 	seen := map[ssa.Instruction]bool{}
 	add := func(accs []dataAccess) {
@@ -132,7 +132,7 @@ func fanoutConcurrentAccesses(root ssa.Value, spawner *ssa.Function, g *ssa.Go, 
 	return accesses
 }
 
-func concurrentFanoutFuncs(spawner *ssa.Function, g *ssa.Go, goro map[*ssa.Function]bool) map[*ssa.Function]bool {
+func concurrentFanoutFuncs(spawner *ssa.Function, g ssa.Instruction, goro map[*ssa.Function]bool) map[*ssa.Function]bool {
 	out := map[*ssa.Function]bool{}
 	for fn := range goro {
 		if fn != nil {
@@ -163,7 +163,7 @@ func concurrentFanoutFuncs(spawner *ssa.Function, g *ssa.Go, goro map[*ssa.Funct
 	return out
 }
 
-func spawnerAccessesBetween(root ssa.Value, fn *ssa.Function, g *ssa.Go, wait ssa.Instruction) []dataAccess {
+func spawnerAccessesBetween(root ssa.Value, fn *ssa.Function, g ssa.Instruction, wait ssa.Instruction) []dataAccess {
 	if fn == nil {
 		return nil
 	}
@@ -287,7 +287,7 @@ func closureFreeVarsBoundTo(spawner, closure *ssa.Function, cell ssa.Value) []*s
 	return out
 }
 
-func waitGroupOfGo(fn *ssa.Function, g *ssa.Go) ssa.Value {
+func waitGroupOfGo(fn *ssa.Function, g ssa.Instruction) ssa.Value {
 	var wg ssa.Value
 	for _, b := range fn.Blocks {
 		for _, instr := range b.Instrs {
@@ -305,7 +305,7 @@ func waitGroupOfGo(fn *ssa.Function, g *ssa.Go) ssa.Value {
 	return wg
 }
 
-func findWaitAfter(fn *ssa.Function, g *ssa.Go, wg ssa.Value) ssa.Instruction {
+func findWaitAfter(fn *ssa.Function, g ssa.Instruction, wg ssa.Value) ssa.Instruction {
 	for _, b := range fn.Blocks {
 		for _, instr := range b.Instrs {
 			call, ok := instr.(*ssa.Call)
@@ -350,7 +350,7 @@ func dominatesInstr(a, b ssa.Instruction) bool {
 	return ab.Dominates(bb)
 }
 
-func spawnerTouchesBetween(root ssa.Value, fn *ssa.Function, g *ssa.Go, wait ssa.Instruction) bool {
+func spawnerTouchesBetween(root ssa.Value, fn *ssa.Function, g ssa.Instruction, wait ssa.Instruction) bool {
 	derived := deriveOwnAddrs(root, map[*ssa.Function]bool{fn: true})
 	for v := range derived {
 		refs := v.Referrers()
@@ -359,6 +359,12 @@ func spawnerTouchesBetween(root ssa.Value, fn *ssa.Function, g *ssa.Go, wait ssa
 		}
 		for _, ref := range *refs {
 			if ref.Parent() != fn || ref == g || ref == wait {
+				continue
+			}
+			if _, ok := ref.(*ssa.Go); ok {
+				continue
+			}
+			if _, ok := ref.(*ssa.MakeClosure); ok {
 				continue
 			}
 			if call, ok := ref.(*ssa.Call); ok {

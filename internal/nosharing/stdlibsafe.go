@@ -1,7 +1,11 @@
 package nosharing
 
 import (
+	"go/build"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	"golang.org/x/tools/go/ssa"
 )
@@ -60,6 +64,13 @@ func isStdlibReadOnlyCall(fn *ssa.Function) bool {
 	if byName == nil {
 		return false
 	}
+	return byName[calleeBaseName(fn)]
+}
+
+func calleeBaseName(fn *ssa.Function) string {
+	if fn == nil {
+		return ""
+	}
 	name := fn.Name()
 	if i := strings.LastIndex(name, "."); i >= 0 {
 		name = name[i+1:]
@@ -67,5 +78,71 @@ func isStdlibReadOnlyCall(fn *ssa.Function) bool {
 	if i := strings.IndexByte(name, '['); i >= 0 {
 		name = name[:i]
 	}
-	return byName[name]
+	return name
+}
+
+var stdlibPathCache sync.Map // string -> bool
+
+// calleeInGOROOT reports whether fn is defined in the standard library.
+// Testdata and module-cache packages must not match (no-dot paths are not
+// enough — use GOROOT src existence, then the function's file).
+func calleeInGOROOT(fn *ssa.Function) bool {
+	if fn == nil {
+		return false
+	}
+	if orig := fn.Origin(); orig != nil {
+		fn = orig
+	}
+	if path := calleePkgPath(fn); path != "" && stdlibPkgPath(path) {
+		return true
+	}
+	return fileInGOROOT(funcFilename(fn))
+}
+
+func stdlibPkgPath(path string) bool {
+	if path == "" || strings.Contains(path, ".") {
+		return false
+	}
+	if v, ok := stdlibPathCache.Load(path); ok {
+		return v.(bool)
+	}
+	goroot := build.Default.GOROOT
+	ok := false
+	if goroot != "" {
+		_, err := os.Stat(filepath.Join(goroot, "src", filepath.FromSlash(path)))
+		ok = err == nil
+	}
+	stdlibPathCache.Store(path, ok)
+	return ok
+}
+
+func fileInGOROOT(file string) bool {
+	if file == "" {
+		return false
+	}
+	goroot := build.Default.GOROOT
+	if goroot != "" && strings.HasPrefix(file, goroot) {
+		return true
+	}
+	return strings.Contains(file, "/go/src/")
+}
+
+func funcFilename(fn *ssa.Function) string {
+	if fn == nil {
+		return ""
+	}
+	prog := fn.Prog
+	if prog == nil && fn.Pkg != nil {
+		prog = fn.Pkg.Prog
+	}
+	if prog == nil || prog.Fset == nil {
+		return ""
+	}
+	if fn.Pos().IsValid() {
+		return prog.Fset.Position(fn.Pos()).Filename
+	}
+	if obj := fn.Object(); obj != nil && obj.Pos().IsValid() {
+		return prog.Fset.Position(obj.Pos()).Filename
+	}
+	return ""
 }

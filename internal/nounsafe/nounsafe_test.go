@@ -10,5 +10,5 @@ import (
 
 func TestNounsafe(t *testing.T) {
 	testdata := analysistest.TestData()
-	analysistest.Run(t, testdata, nounsafe.Analyzer, "a", "asm", "cgo", "clean", "linkname", "refl")
+	analysistest.Run(t, testdata, nounsafe.Analyzer, "a", "asm", "cgo", "clean", "linkname", "refl", "good_nolint", "bad_nolint_nosharing")
 }

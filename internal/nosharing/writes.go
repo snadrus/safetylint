@@ -93,7 +93,7 @@ func globalWrittenIn(pass *analysis.Pass, gl *ssa.Global, funcs map[*ssa.Functio
 // valueSnapshotReadOnly reports that root is a non-pointer struct/array
 // value whose only spawner-side writes after go are whole-cell reassignments
 // (not field stores). Used for Broadcast-style map-lookup captures.
-func valueSnapshotReadOnly(root ssa.Value, spawner *ssa.Function, g *ssa.Go) bool {
+func valueSnapshotReadOnly(root ssa.Value, spawner *ssa.Function, g ssa.Instruction) bool {
 	if root == nil || spawner == nil || g == nil {
 		return false
 	}
@@ -117,7 +117,7 @@ func valueSnapshotReadOnly(root ssa.Value, spawner *ssa.Function, g *ssa.Go) boo
 	return onlyWholeValueReassignAfterGo(root, spawner, g)
 }
 
-func onlyWholeValueReassignAfterGo(root ssa.Value, fn *ssa.Function, g *ssa.Go) bool {
+func onlyWholeValueReassignAfterGo(root ssa.Value, fn *ssa.Function, g ssa.Instruction) bool {
 	goBlock := g.Block()
 	goIdx := instrIndex(goBlock, g)
 	derived := deriveOwnAddrs(root, map[*ssa.Function]bool{fn: true})
@@ -174,7 +174,7 @@ func onlyWholeValueReassignAfterGo(root ssa.Value, fn *ssa.Function, g *ssa.Go) 
 	return saw
 }
 
-func isWrittenAfterGo(root ssa.Value, spawner *ssa.Function, g *ssa.Go, all []*ssa.Function, goro map[*ssa.Function]bool) bool {
+func isWrittenAfterGo(root ssa.Value, spawner *ssa.Function, g ssa.Instruction, all []*ssa.Function, goro map[*ssa.Function]bool) bool {
 	for _, f := range all {
 		if f == nil || goro[f] {
 			continue
@@ -190,7 +190,7 @@ func isWrittenAfterGo(root ssa.Value, spawner *ssa.Function, g *ssa.Go, all []*s
 	return hasWriteNotBefore(root, spawner, g)
 }
 
-func hasWriteNotBefore(root ssa.Value, fn *ssa.Function, g *ssa.Go) bool {
+func hasWriteNotBefore(root ssa.Value, fn *ssa.Function, g ssa.Instruction) bool {
 	if fn == nil {
 		return false
 	}
@@ -353,6 +353,19 @@ func derivesFromOwn(instr ssa.Instruction, set map[ssa.Value]bool) bool {
 		if fieldAddrOfIndirect(in.X) {
 			return false
 		}
+		// Load of a struct field is a value copy. Including it made
+		// address-taken read-only locals look "written" when the copy was
+		// passed to a Fact-less call (webrpc status.FilAddress).
+		if _, ok := in.X.(*ssa.FieldAddr); ok {
+			return false
+		}
+		// Load of *T where T is not a pointer/map/slice/chan/interface is a
+		// value copy of a captured local (SectorFileType, uuid, Duration).
+		if !typeIsIndirect(in.Type()) {
+			return false
+		}
+		// Load of the root cell itself (map/slice header) stays in-set so
+		// MapUpdate/append still see the loaded header.
 		return set[in.X]
 	case *ssa.Slice:
 		// Slicing a slice/string header in-object stays related; the backing
@@ -470,6 +483,9 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 	// Interface method call: the iface value itself is not mutated; []byte /
 	// string payloads are treated as read-only unless a concrete body says
 	// otherwise (Broadcast-style fan-out of immutable messages).
+	// Passing *T into an interface method whose parameter is not the
+	// receiver is not assumed to write *T unless the name looks like a setter
+	// (TaskInterface.Adder/Do/CanAccept; cfg.DB.Query does not write *Cfg).
 	if c.IsInvoke() {
 		if c.Value == v {
 			return false
@@ -477,18 +493,23 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 		if argOrRecvIs(c, v) && isReadOnlyPayloadType(v.Type()) {
 			return false
 		}
+		if argOrRecvIs(c, v) && !invokeLooksLikeSetter(c) {
+			return false
+		}
 	}
 
 	callee := c.StaticCallee()
 	if callee != nil {
-		if isShareSafeStdlib(v) {
+		if isShareSafeStdlib(v) || isHarmonyDBType(v.Type()) {
 			return false
 		}
-		if isAtomicCallee(callee) {
-			// Atomic ops mutate the atomic cell. Count as writes so share/freeze
-			// sites must prove atomics-only (or a lock) rather than treating
-			// them as read-only no-ops. Freeze still skips them in globalWrites.
-			return true
+		if isDBClientCallee(callee) && (receiverIs(c, v) || argOrRecvIs(c, v) && isHarmonyDBType(v.Type())) {
+			return false
+		}
+		if isAtomicCallee(callee) || isAtomicSyncMethod(callee, v) {
+			// sync/atomic Load/Store/CAS/Add/… are synchronization, like
+			// WaitGroup/Once/Mutex: they do not count as racy shared writes.
+			return false
 		}
 		if isStdlibReadOnlyCall(callee) {
 			return false
@@ -502,6 +523,14 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 		if isRWMutexMethod(callee) && receiverIs(c, v) {
 			return true
 		}
+		// GOROOT: do not SSA-scan; not a write unless listed in curatedWriters
+		// (or already handled as a builtin append/copy/delete above).
+		if isSrcFirstSliceCopy(callee) && firstSliceArgIs(c, v) {
+			return false
+		}
+		if calleeInGOROOT(callee) {
+			return isCuratedWriter(callee) && argOrRecvIs(c, v)
+		}
 		// Any callee with a body: look through (including cross-package when
 		// SSA bodies are present).
 		if len(callee.Blocks) > 0 {
@@ -511,8 +540,8 @@ func writeViaCallVisiting(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, p
 		if known, writes := writesParamsFact(pass, c, v); known {
 			return writes
 		}
-		// Still unknown: pessimistic. ([]byte/string read-only defaults apply
-		// only to interface invokes above — not arbitrary bodyless APIs.)
+		// Still unknown (non-GOROOT Fact-less): pessimistic. ([]byte/string
+		// read-only defaults apply only to interface invokes above.)
 		if pessimistic && argOrRecvIs(c, v) {
 			return true
 		}
@@ -552,6 +581,11 @@ func isReadOnlyPayloadType(t types.Type) bool {
 		}
 	}
 	return false
+}
+
+func firstSliceArgIs(c *ssa.CallCommon, v ssa.Value) bool {
+	i := firstSliceArgIndex(c)
+	return i >= 0 && i < len(c.Args) && c.Args[i] == v
 }
 
 func calleeWritesParam(pass *analysis.Pass, c *ssa.CallCommon, v ssa.Value, callee *ssa.Function, visiting map[*ssa.Function]bool) bool {
@@ -604,6 +638,9 @@ func isWhitelistedSync(v ssa.Value) bool {
 	if isNamedSyncType(v.Type(), "WaitGroup", "Once", "Map") {
 		return true
 	}
+	if isAtomicValueType(v.Type()) {
+		return true
+	}
 	return isSingleflightGroup(v.Type())
 }
 
@@ -631,7 +668,41 @@ func isShareSafeStdlib(v ssa.Value) bool {
 	if v == nil {
 		return false
 	}
-	return isContextType(v.Type()) || isHTTPServerType(v.Type())
+	return isContextType(v.Type()) || isHTTPServerType(v.Type()) || isHarmonyDBType(v.Type())
+}
+
+func isHarmonyDBType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	t = types.Unalias(t)
+	for {
+		p, ok := t.(*types.Pointer)
+		if !ok {
+			break
+		}
+		t = types.Unalias(p.Elem())
+	}
+	n, ok := t.(*types.Named)
+	if !ok {
+		return false
+	}
+	obj := n.Obj()
+	return obj != nil && obj.Name() == "DB" && obj.Pkg() != nil &&
+		strings.Contains(obj.Pkg().Path(), "harmonydb")
+}
+
+func isDBClientCallee(fn *ssa.Function) bool {
+	if fn == nil {
+		return false
+	}
+	switch calleeBaseName(fn) {
+	case "Query", "QueryRow", "Exec", "Select", "Get", "Begin", "BeginTransaction",
+		"Close", "Ping", "Prepare", "QueryContext", "ExecContext", "QueryRowContext",
+		"SelectRow", "ExecRaw", "QueryRaw", "ReadOnly":
+		return true
+	}
+	return false
 }
 
 func isContextType(t types.Type) bool {
@@ -702,6 +773,9 @@ func isWhitelistedSyncMethod(fn *ssa.Function, recv ssa.Value) bool {
 	recvMatches := func(typeName string) bool {
 		return recv != nil && isNamedSyncType(recv.Type(), typeName)
 	}
+	if isAtomicSyncMethod(fn, recv) {
+		return true
+	}
 	switch name {
 	case "Add", "Done", "Wait":
 		return recvMatches("WaitGroup") || recvTypeIs(fn, "WaitGroup")
@@ -714,6 +788,22 @@ func isWhitelistedSyncMethod(fn *ssa.Function, recv ssa.Value) bool {
 		return (recv != nil && isSingleflightGroup(recv.Type())) || isSingleflightGroup(fn.Signature.Recv().Type())
 	case "Load", "Store", "LoadOrStore", "LoadAndDelete", "Delete", "Swap", "CompareAndSwap", "Range", "Clear":
 		return recvMatches("Map") || recvTypeIs(fn, "Map")
+	}
+	return false
+}
+
+func isAtomicSyncMethod(fn *ssa.Function, recv ssa.Value) bool {
+	if fn == nil {
+		return false
+	}
+	if isAtomicCallee(fn) {
+		return true
+	}
+	if recv != nil && isAtomicValueType(recv.Type()) {
+		return true
+	}
+	if fn.Signature != nil && fn.Signature.Recv() != nil && isAtomicValueType(fn.Signature.Recv().Type()) {
+		return true
 	}
 	return false
 }

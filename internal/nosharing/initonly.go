@@ -7,12 +7,11 @@ import (
 	"golang.org/x/tools/go/ssa"
 )
 
-// exportInitOnlyFacts publishes InitOnly on exported registration helpers:
-// they mutate only map/slice package globals (registry tables), do not spawn,
-// and have no non-init callers inside this package (zero local callers is OK —
-// typical var _ = Reg(…) from other packages).
-func (a *analyzer) exportInitOnlyFacts() {
-	if a.pkg == nil || a.pass == nil || !factsEnabled() {
+// discoverInitOnlyHelpers records same-package InitOnly registration helpers
+// on a.localInitOnly. This runs even when Facts are disabled so freeze
+// analysis still allows Reg-style map writes in the defining package.
+func (a *analyzer) discoverInitOnlyHelpers() {
+	if a.pkg == nil {
 		return
 	}
 	a.localInitOnly = map[*types.Func]bool{}
@@ -38,7 +37,22 @@ func (a *analyzer) exportInitOnlyFacts() {
 			continue
 		}
 		a.localInitOnly[obj] = true
-		a.pass.ExportObjectFact(obj, &InitOnly{})
+	}
+}
+
+// exportInitOnlyFacts publishes InitOnly on exported registration helpers:
+// they mutate only map/slice package globals (registry tables), do not spawn,
+// and have no non-init callers inside this package (zero local callers is OK —
+// typical var _ = Reg(…) from other packages).
+func (a *analyzer) exportInitOnlyFacts() {
+	if a.pkg == nil || a.pass == nil || !factsEnabled() {
+		return
+	}
+	if len(a.localInitOnly) == 0 {
+		a.discoverInitOnlyHelpers()
+	}
+	for obj := range a.localInitOnly {
+		a.exportObjectFact(obj, &InitOnly{})
 	}
 }
 

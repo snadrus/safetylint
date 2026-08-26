@@ -10,7 +10,7 @@ import (
 // collectRoots finds values shared between the spawning goroutine and the
 // callee: closure free variables, pointer-ish arguments, and package globals
 // accessed from goroutine-reachable code.
-func collectRoots(g *ssa.Go, callee *ssa.Function, globals map[*ssa.Global]bool) []sharedRoot {
+func collectRoots(value ssa.Value, args []ssa.Value, callee *ssa.Function, globals map[*ssa.Global]bool) []sharedRoot {
 	var roots []sharedRoot
 	seen := map[ssa.Value]bool{}
 
@@ -27,30 +27,32 @@ func collectRoots(g *ssa.Go, callee *ssa.Function, globals map[*ssa.Global]bool)
 	// writes after go are visible. Package globals are freeze-owned: do
 	// not also treat a FreeVar cell that merely names a global as a
 	// separate shared heap root.
-	if common := g.Common(); common != nil {
-		if mc, ok := common.Value.(*ssa.MakeClosure); ok {
-			for i, bind := range mc.Bindings {
-				name := "?"
-				if i < len(callee.FreeVars) {
-					name = callee.FreeVars[i].Name()
-				}
-				add(bind, "captured free variable "+name)
-				if i < len(callee.FreeVars) && !isGlobalObject(bind) {
-					add(callee.FreeVars[i], "captured free variable "+name)
-				}
+	if mc, ok := value.(*ssa.MakeClosure); ok {
+		for i, bind := range mc.Bindings {
+			name := "?"
+			if callee != nil && i < len(callee.FreeVars) {
+				name = callee.FreeVars[i].Name()
+			}
+			add(bind, "captured free variable "+name)
+			if callee != nil && i < len(callee.FreeVars) && !isGlobalObject(bind) {
+				add(callee.FreeVars[i], "captured free variable "+name)
 			}
 		}
 	}
 
-	// Arguments at the go call site.
-	for i, arg := range g.Common().Args {
+	// Arguments at the go call site (empty for AfterFunc-style callback slots).
+	for i, arg := range args {
 		if !mayContainPointers(arg.Type()) && !isAddressTakenLocal(arg) {
 			continue
 		}
 		add(arg, "pointer-ish argument")
-		if i < len(callee.Params) {
+		if callee != nil && i < len(callee.Params) {
 			add(callee.Params[i], "pointer-ish parameter")
 		}
+	}
+
+	if callee == nil {
+		return roots
 	}
 
 	// Package globals accessed from goroutine-reachable functions.
@@ -118,7 +120,7 @@ func sharePeers(focus ssa.Value, roots []sharedRoot) []sharedRoot {
 
 // sameObjectPeersGo returns roots that alias the same cell as focus (Alloc /
 // Global / FreeVar / Parameter bindings), excluding unrelated same-type locals.
-func sameObjectPeersGo(focus ssa.Value, roots []sharedRoot, spawner *ssa.Function, g *ssa.Go, allFuncs map[*ssa.Function]bool) []sharedRoot {
+func sameObjectPeersGo(focus ssa.Value, roots []sharedRoot, spawner *ssa.Function, g ssa.Instruction, allFuncs map[*ssa.Function]bool) []sharedRoot {
 	if focus == nil {
 		return nil
 	}
@@ -137,6 +139,19 @@ func sameObjectPeersGo(focus ssa.Value, roots []sharedRoot, spawner *ssa.Functio
 	cells := map[ssa.Value]bool{focus: true}
 	if obj := stripToObject(focus); obj != nil {
 		cells[obj] = true
+	}
+	// The go callee's own parameters are bound only via this go (below).
+	// argsPassedAs on those params would pull in every *T that ever called
+	// the same method, merging unrelated objects.
+	goCalleeParam := map[ssa.Value]bool{}
+	if g != nil {
+		if common := callCommonOf(g); common != nil {
+			if cal := staticCallee(common); cal != nil {
+				for _, p := range cal.Params {
+					goCalleeParam[p] = true
+				}
+			}
+		}
 	}
 	// Fixpoint: chase Alloc↔Parameter↔FreeVar aliases through call/go sites.
 	for changed := true; changed; {
@@ -162,17 +177,21 @@ func sameObjectPeersGo(focus ssa.Value, roots []sharedRoot, spawner *ssa.Functio
 			for _, p := range paramsReceivingCell(c, funcs) {
 				add(p)
 			}
-			for _, x := range argsPassedAs(c, funcs) {
-				add(x)
-				add(stripToObject(x))
+			if !goCalleeParam[c] {
+				for _, x := range argsPassedAs(c, funcs) {
+					add(x)
+					add(stripToObject(x))
+				}
 			}
 			if g != nil {
-				for i, arg := range g.Common().Args {
-					if arg == c || stripToObject(arg) == c || stripToObject(arg) == stripToObject(c) {
-						add(arg)
-						add(stripToObject(arg))
-						if cal := staticCallee(g.Common()); cal != nil && i < len(cal.Params) {
-							add(cal.Params[i])
+				if common := callCommonOf(g); common != nil {
+					for i, arg := range common.Args {
+						if arg == c || stripToObject(arg) == c || stripToObject(arg) == stripToObject(c) {
+							add(arg)
+							add(stripToObject(arg))
+							if cal := staticCallee(common); cal != nil && i < len(cal.Params) {
+								add(cal.Params[i])
+							}
 						}
 					}
 				}
@@ -325,15 +344,19 @@ func paramsReceivingCell(cell ssa.Value, funcs map[*ssa.Function]bool) []*ssa.Pa
 
 // goParamBindings returns Alloc/Global cells passed as the go argument that
 // becomes Parameter focus (or focus itself when not a Parameter).
-func goParamBindings(g *ssa.Go, focus ssa.Value) []ssa.Value {
+func goParamBindings(g ssa.Instruction, focus ssa.Value) []ssa.Value {
 	if g == nil || focus == nil {
+		return nil
+	}
+	common := callCommonOf(g)
+	if common == nil {
 		return nil
 	}
 	p, ok := focus.(*ssa.Parameter)
 	if !ok || p.Parent() == nil {
 		return nil
 	}
-	cal := staticCallee(g.Common())
+	cal := staticCallee(common)
 	if cal == nil {
 		return nil
 	}
@@ -350,10 +373,10 @@ func goParamBindings(g *ssa.Go, focus ssa.Value) []ssa.Value {
 			break
 		}
 	}
-	if idx < 0 || idx >= len(g.Common().Args) {
+	if idx < 0 || idx >= len(common.Args) {
 		return nil
 	}
-	cell := stripToObject(g.Common().Args[idx])
+	cell := stripToObject(common.Args[idx])
 	if cell == nil {
 		return nil
 	}

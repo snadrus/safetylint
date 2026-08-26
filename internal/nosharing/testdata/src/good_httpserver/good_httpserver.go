@@ -17,3 +17,14 @@ func StartAdmin(ctx context.Context, srv *http.Server) { // want StartAdmin:"may
 		}
 	}()
 }
+
+// Listen re-exports GOROOT retain of *Server (curatedRetains).
+func Listen(s *http.Server) error { // want Listen:"mayShareParams param0:write"
+	return s.ListenAndServe()
+}
+
+func serveAndStop() {
+	srv := &http.Server{Addr: ":0"}
+	go srv.ListenAndServe()
+	_ = srv.Shutdown(context.Background())
+}

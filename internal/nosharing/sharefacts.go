@@ -88,8 +88,8 @@ func (a *analyzer) exportShareFacts() {
 		// Publish only exported APIs that retain params. Bare MaySpawn is
 		// unnecessary for freeze (Fact-less cross-pkg calls stay spawn points)
 		// and would clutter analysistest expectations.
-		if factsEnabled() && obj.Exported() && len(fact.Params) > 0 {
-			a.pass.ExportObjectFact(obj, fact)
+		if obj.Exported() && len(fact.Params) > 0 {
+			a.exportObjectFact(obj, fact)
 		}
 	}
 	for obj := range localSpawn {
@@ -284,8 +284,8 @@ func (a *analyzer) sharedParamsOf(fn *ssa.Function, allFuncs map[*ssa.Function]b
 				}
 				recordClosureShares(c.Value, record)
 			case *ssa.MakeClosure:
-				// Closure may be stored then go'ed; if any referrer is Go,
-				// its bindings are shared.
+				// Closure may be stored then go'ed (or passed to AfterFunc);
+				// if any referrer is a spawn, its bindings are shared.
 				if closureIsGoed(in) {
 					recordClosureShares(in, record)
 				}
@@ -301,8 +301,28 @@ func (a *analyzer) sharedParamsOf(fn *ssa.Function, allFuncs map[*ssa.Function]b
 				if cal == nil {
 					continue
 				}
+				// AfterFunc / HandleFunc / NotifyFunc: spawn of the callback,
+				// same as `go` (captures / func param), not a retain-share.
+				for _, i := range asyncCallbackIndices(cal) {
+					if i < 0 || i >= len(c.Args) {
+						continue
+					}
+					arg := c.Args[i]
+					if mc, ok := arg.(*ssa.MakeClosure); ok {
+						recordClosureShares(mc, record)
+					} else {
+						record(arg, stripToObject(arg))
+					}
+				}
 				fact, ok := lookupShare(funcObject(cal))
 				if !ok || fact == nil {
+					for _, sp := range curatedRetainParams(cal) {
+						arg := argForSharedParam(c, cal, sp)
+						if arg == nil {
+							continue
+						}
+						recordPropagated(arg, sp)
+					}
 					continue
 				}
 				for _, sp := range fact.Params {
@@ -353,6 +373,13 @@ func closureIsGoed(mc *ssa.MakeClosure) bool {
 		if g, ok := r.(*ssa.Go); ok && g.Common().Value == mc {
 			return true
 		}
+		if c := callCommonOf(r); c != nil {
+			for _, i := range asyncCallbackIndices(c.StaticCallee()) {
+				if i >= 0 && i < len(c.Args) && c.Args[i] == mc {
+					return true
+				}
+			}
+		}
 	}
 	return false
 }
@@ -365,20 +392,44 @@ func goroutineReachableFrom(fn *ssa.Function, pkg *ssa.Package) map[*ssa.Functio
 		return out
 	}
 	var seeds []*ssa.Function
+	addSeed := func(cal *ssa.Function) {
+		if cal != nil {
+			seeds = append(seeds, cal)
+		}
+	}
+	addCallback := func(arg ssa.Value) {
+		if arg == nil {
+			return
+		}
+		if cal, ok := arg.(*ssa.Function); ok {
+			addSeed(cal)
+			return
+		}
+		if mc, ok := arg.(*ssa.MakeClosure); ok {
+			if clo, ok := mc.Fn.(*ssa.Function); ok {
+				addSeed(clo)
+			}
+		}
+	}
 	for _, b := range fn.Blocks {
 		for _, instr := range b.Instrs {
 			g, ok := instr.(*ssa.Go)
-			if !ok {
+			if ok {
+				c := g.Common()
+				if cal := c.StaticCallee(); cal != nil {
+					addSeed(cal)
+					continue
+				}
+				addCallback(c.Value)
 				continue
 			}
-			c := g.Common()
-			if cal := c.StaticCallee(); cal != nil {
-				seeds = append(seeds, cal)
+			c := callCommonOf(instr)
+			if c == nil {
 				continue
 			}
-			if mc, ok := c.Value.(*ssa.MakeClosure); ok {
-				if clo, ok := mc.Fn.(*ssa.Function); ok {
-					seeds = append(seeds, clo)
+			for _, i := range asyncCallbackIndices(c.StaticCallee()) {
+				if i >= 0 && i < len(c.Args) {
+					addCallback(c.Args[i])
 				}
 			}
 		}
@@ -502,12 +553,17 @@ func (a *analyzer) checkShareFactCalls(reported map[string]bool) {
 					continue
 				}
 				var fact MayShareParams
+				gotFact := false
 				if cal.Pkg == a.pkg {
-					if !a.localShareFact(obj, &fact) {
+					gotFact = a.localShareFact(obj, &fact)
+				} else if a.pass != nil && factsEnabled() {
+					gotFact = a.pass.ImportObjectFact(obj, &fact)
+				}
+				if !gotFact {
+					fact.Params = curatedRetainParams(cal)
+					if len(fact.Params) == 0 {
 						continue
 					}
-				} else if !a.pass.ImportObjectFact(obj, &fact) {
-					continue
 				}
 				for _, sp := range fact.Params {
 					// Same-package write shares without a tied mutex are
@@ -690,7 +746,7 @@ func (a *analyzer) importMaySpawn(obj *types.Func) bool {
 			return true
 		}
 	}
-	if a.pass == nil {
+	if a.pass == nil || !factsEnabled() {
 		return false
 	}
 	var spawn MaySpawn

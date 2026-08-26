@@ -23,6 +23,7 @@ func objectGuarded(root ssa.Value, funcs map[*ssa.Function]bool) bool {
 
 // accessesGuarded runs the guard cascade over a precomputed access list.
 func accessesGuarded(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Function]bool) bool {
+	accesses = prepareGuardAccesses(accesses)
 	if len(accesses) == 0 {
 		return true
 	}
@@ -41,6 +42,12 @@ func accessesGuarded(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Funct
 	if constIndexPartitionOK(root, accesses) {
 		return true
 	}
+	if rangePartitionOK(root, accesses) {
+		return true
+	}
+	if fieldPartitionedGuards(root, accesses, funcs) {
+		return true
+	}
 	return false
 }
 
@@ -50,16 +57,17 @@ func accessesGuarded(root ssa.Value, accesses []dataAccess, funcs map[*ssa.Funct
 // values loaded out of atomic cells (separate heap objects) do not poison the
 // parent object's atomics-only proof.
 func objectGuardedRoots(roots []sharedRoot, funcs map[*ssa.Function]bool) bool {
-	return objectGuardedRootsAfter(roots, funcs, nil, nil)
+	return objectGuardedRootsAfter(roots, funcs, nil, nil, nil)
 }
 
 // mutexGuardsGoRootsAfter is mutexGuardsGoRoots ignoring spawner accesses that
-// dominate the go (construction / init before the value is shared).
-func mutexGuardsGoRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, spawner *ssa.Function, g *ssa.Go) bool {
-	return objectGuardedRootsAfter(roots, funcs, spawner, g)
+// dominate the go (construction / init before the value is shared) and
+// accesses in unexported helpers only called before that go.
+func mutexGuardsGoRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, spawner *ssa.Function, g ssa.Instruction, preShare map[*ssa.Function]bool) bool {
+	return objectGuardedRootsAfter(roots, funcs, spawner, g, preShare)
 }
 
-func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, spawner *ssa.Function, g *ssa.Go) bool {
+func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, spawner *ssa.Function, g ssa.Instruction, preShare map[*ssa.Function]bool) bool {
 	if len(roots) >= maxRootAliases {
 		return false
 	}
@@ -69,7 +77,7 @@ func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, s
 	var dataRoots []ssa.Value
 	perRoot := map[ssa.Value][]dataAccess{}
 	for _, root := range roots {
-		if isChanType(root.val.Type()) || isWhitelistedSync(root.val) || isSyncMutex(root.val) || isSyncRWMutex(root.val) || isShareSafeStdlib(root.val) {
+		if isChanType(root.val.Type()) || isWhitelistedSync(root.val) || isSyncMutex(root.val) || isSyncRWMutex(root.val) || isShareSafeStdlib(root.val) || isHarmonyDBType(root.val.Type()) {
 			continue
 		}
 		// Package globals are covered by freeze analysis; including them here
@@ -80,20 +88,22 @@ func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, s
 		dataRoots = append(dataRoots, root.val)
 		rootVisiting := map[ssa.Value]bool{}
 		rAcc := collectDataAccessesDeep(root.val, funcs, rootVisiting)
-		perRoot[root.val] = rAcc
+		var filtered []dataAccess
 		for _, acc := range rAcc {
-			if seenAcc[acc.instr] {
+			if skipPreShareAccess(acc, spawner, g, preShare) {
 				continue
 			}
-			// Pre-share construction in the spawner is not a concurrent access.
-			if spawner != nil && g != nil && acc.instr.Parent() == spawner && dominatesInstr(acc.instr, g) {
+			filtered = append(filtered, acc)
+			if seenAcc[acc.instr] {
 				continue
 			}
 			seenAcc[acc.instr] = true
 			accesses = append(accesses, acc)
 		}
+		perRoot[root.val] = prepareGuardAccesses(filtered)
 		_ = visiting
 	}
+	accesses = prepareGuardAccesses(accesses)
 	if len(accesses) == 0 {
 		return true
 	}
@@ -140,6 +150,12 @@ func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, s
 	if len(dataRoots) > 0 && constIndexPartitionOK(dataRoots[0], accesses) {
 		return true
 	}
+	if len(dataRoots) > 0 && rangePartitionOK(dataRoots[0], accesses) {
+		return true
+	}
+	if len(dataRoots) > 0 && fieldPartitionedGuards(dataRoots[0], accesses, funcs) {
+		return true
+	}
 
 	// Atomics (and other per-object proofs) run per written root so values
 	// loaded from atomic cells do not poison the parent object.
@@ -161,6 +177,9 @@ func objectGuardedRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, s
 			continue
 		}
 		if atomicsOnlyAccesses(rAcc) {
+			continue
+		}
+		if fieldPartitionedGuards(r, rAcc, funcs) {
 			continue
 		}
 		return false
@@ -520,7 +539,14 @@ func isSliceHeaderStore(acc dataAccess) bool {
 }
 
 func isSliceOrArrayRoot(root ssa.Value) bool {
-	t := types.Unalias(root.Type())
+	if root == nil {
+		return false
+	}
+	return typeIsSliceOrArray(root.Type())
+}
+
+func typeIsSliceOrArray(t types.Type) bool {
+	t = types.Unalias(t)
 	if p, ok := t.(*types.Pointer); ok {
 		t = types.Unalias(p.Elem())
 	}
@@ -550,4 +576,241 @@ func constIndexStore(acc dataAccess) (int64, bool) {
 		return 0, false
 	}
 	return val, true
+}
+
+type indexRange struct{ lo, hi int64 }
+
+// rangePartitionOK accepts concurrent writers of disjoint [start,end)
+// slice ranges (const bounds). Reads and overlapping ranges fail.
+func rangePartitionOK(root ssa.Value, accesses []dataAccess) bool {
+	if root == nil || len(accesses) == 0 {
+		return false
+	}
+	if !isSliceOrArrayRoot(root) {
+		ok := false
+		for _, acc := range accesses {
+			if isSliceOrArrayRoot(stripToObject(acc.addr)) || isSliceOrArrayRoot(acc.addr) {
+				ok = true
+				break
+			}
+			if sl := sliceOfAccess(acc); sl != nil {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	rangeFns := map[*ssa.Function]bool{}
+	for _, acc := range accesses {
+		if _, ok := writeRangeOf(acc); ok {
+			if fn := acc.instr.Parent(); fn != nil {
+				rangeFns[fn] = true
+			}
+		}
+	}
+	byFn := map[*ssa.Function][]indexRange{}
+	saw := false
+	for _, acc := range accesses {
+		if isSliceHeaderLoad(acc) {
+			continue
+		}
+		if isSliceHeaderStore(acc) {
+			fn := acc.instr.Parent()
+			if fn != nil && !rangeFns[fn] {
+				continue
+			}
+			return false
+		}
+		if !acc.write {
+			return false
+		}
+		r, ok := writeRangeOf(acc)
+		if !ok {
+			return false
+		}
+		fn := acc.instr.Parent()
+		if fn == nil {
+			return false
+		}
+		byFn[fn] = append(byFn[fn], r)
+		saw = true
+	}
+	if !saw || len(byFn) == 0 {
+		return false
+	}
+	merged := map[*ssa.Function]indexRange{}
+	for fn, rs := range byFn {
+		m, ok := mergeRanges(rs)
+		if !ok {
+			return false
+		}
+		merged[fn] = m
+	}
+	fns := make([]*ssa.Function, 0, len(merged))
+	for fn := range merged {
+		fns = append(fns, fn)
+	}
+	for i := 0; i < len(fns); i++ {
+		for j := i + 1; j < len(fns); j++ {
+			if rangesOverlap(merged[fns[i]], merged[fns[j]]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func writeRangeOf(acc dataAccess) (indexRange, bool) {
+	// A write through dst[lo:hi] owns the whole [lo,hi), not just the
+	// element actually stored (overlapping slices are a race).
+	if sl := sliceOfAccess(acc); sl != nil {
+		return constSliceBounds(sl)
+	}
+	if idx, ok := constIndexStore(acc); ok {
+		return indexRange{idx, idx + 1}, true
+	}
+	return indexRange{}, false
+}
+
+func sliceOfAccess(acc dataAccess) *ssa.Slice {
+	if sl, ok := acc.addr.(*ssa.Slice); ok {
+		return sl
+	}
+	cur := acc.addr
+	if st, ok := acc.instr.(*ssa.Store); ok {
+		cur = st.Addr
+	}
+	for cur != nil {
+		switch v := cur.(type) {
+		case *ssa.Slice:
+			return v
+		case *ssa.IndexAddr:
+			if sl, ok := v.X.(*ssa.Slice); ok {
+				return sl
+			}
+			if sl := sliceDef(v.X); sl != nil {
+				return sl
+			}
+			cur = v.X
+		case *ssa.UnOp:
+			if v.Op == token.MUL {
+				cur = v.X
+				continue
+			}
+			return nil
+		default:
+			return sliceDef(cur)
+		}
+	}
+	return nil
+}
+
+func sliceDef(v ssa.Value) *ssa.Slice {
+	if sl, ok := v.(*ssa.Slice); ok {
+		return sl
+	}
+	if u, ok := v.(*ssa.UnOp); ok && u.Op == token.MUL {
+		if sl := sliceDef(u.X); sl != nil {
+			return sl
+		}
+		return uniqueSliceStore(u.X)
+	}
+	return uniqueSliceStore(v)
+}
+
+func uniqueSliceStore(addr ssa.Value) *ssa.Slice {
+	cell := stripToObject(addr)
+	if cell == nil {
+		return nil
+	}
+	refs := cell.Referrers()
+	if refs == nil {
+		return nil
+	}
+	var found *ssa.Slice
+	for _, ref := range *refs {
+		st, ok := ref.(*ssa.Store)
+		if !ok || stripToObject(st.Addr) != cell {
+			continue
+		}
+		sl, ok := st.Val.(*ssa.Slice)
+		if !ok {
+			return nil
+		}
+		if found != nil && found != sl {
+			return nil
+		}
+		found = sl
+	}
+	return found
+}
+
+func constSliceBounds(sl *ssa.Slice) (indexRange, bool) {
+	if sl == nil {
+		return indexRange{}, false
+	}
+	lo, ok := constIntOrZero(sl.Low)
+	if !ok {
+		return indexRange{}, false
+	}
+	if sl.High == nil {
+		return indexRange{}, false
+	}
+	hi, ok := constIntVal(sl.High)
+	if !ok || hi <= lo {
+		return indexRange{}, false
+	}
+	return indexRange{lo, hi}, true
+}
+
+func constIntOrZero(v ssa.Value) (int64, bool) {
+	if v == nil {
+		return 0, true
+	}
+	return constIntVal(v)
+}
+
+func constIntVal(v ssa.Value) (int64, bool) {
+	c, ok := v.(*ssa.Const)
+	if !ok || c.Value == nil {
+		return 0, false
+	}
+	return constant.Int64Val(c.Value)
+}
+
+func mergeRanges(rs []indexRange) (indexRange, bool) {
+	if len(rs) == 0 {
+		return indexRange{}, false
+	}
+	m := rs[0]
+	for _, r := range rs[1:] {
+		if r.lo < m.lo {
+			m.lo = r.lo
+		}
+		if r.hi > m.hi {
+			m.hi = r.hi
+		}
+	}
+	// Reject holes that would hide an overlap with a sibling's interior.
+	covered := make([]bool, int(m.hi-m.lo))
+	for _, r := range rs {
+		for i := r.lo; i < r.hi; i++ {
+			if i < m.lo || i >= m.hi {
+				return indexRange{}, false
+			}
+			covered[i-m.lo] = true
+		}
+	}
+	for _, ok := range covered {
+		if !ok {
+			return indexRange{}, false
+		}
+	}
+	return m, true
+}
+
+func rangesOverlap(a, b indexRange) bool {
+	return a.lo < b.hi && b.lo < a.hi
 }

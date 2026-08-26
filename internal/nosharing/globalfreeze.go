@@ -118,7 +118,7 @@ func (a *analyzer) checkGlobalFreeze(reported map[string]bool) {
 						continue
 					}
 					if mutexOK[gl] == 0 {
-						if mutexGuardsAccesses(gl, allFuncs) {
+						if mutexGuardsGlobal(gl, allFuncs) {
 							mutexOK[gl] = 1
 						} else {
 							mutexOK[gl] = 2
@@ -331,8 +331,8 @@ func (a *analyzer) computeSpawners() map[*ssa.Function]bool {
 
 func (a *analyzer) isSpawnEvent(instr ssa.Instruction, spawner map[*ssa.Function]bool) bool {
 	// http.HandleFunc/Handle and similar only register callbacks; they do not
-	// start serving goroutines. Callback captures are still share events via
-	// checkAsyncCallbackShares. Freeze spawn is Serve/ListenAndServe/go/Facts.
+	// start serving goroutines. Callbacks are analyzed as goroutine bodies
+	// (checkAsyncSpawns). Freeze spawn is Serve/ListenAndServe/go/Facts.
 	var c *ssa.CallCommon
 	switch in := instr.(type) {
 	case *ssa.Go:
@@ -526,8 +526,14 @@ func (a *analyzer) globalWritesCall(c *ssa.CallCommon) []*ssa.Global {
 	if isWhitelistedSyncMethod(callee, recvOfCall(c)) {
 		return nil
 	}
-	if isAtomicCallee(callee) || isStdlibReadOnlyCall(callee) {
+	if isAtomicCallee(callee) || isAtomicSyncMethod(callee, recvOfCall(c)) || isStdlibReadOnlyCall(callee) {
 		return nil
+	}
+	if calleeInGOROOT(callee) {
+		if !isCuratedWriter(callee) {
+			return nil
+		}
+		return a.globalWritesCallArgs(c, true)
 	}
 	if calleeInPkg(callee, a.pkg) && len(callee.Blocks) > 0 {
 		for i, arg := range c.Args {

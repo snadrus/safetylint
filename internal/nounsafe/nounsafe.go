@@ -5,11 +5,13 @@ package nounsafe
 import (
 	"bytes"
 	"go/ast"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"safetylint/internal/nolint"
 	"safetylint/internal/toolver"
 
 	"golang.org/x/tools/go/analysis"
@@ -38,6 +40,13 @@ var Analyzer = &analysis.Analyzer{
 	Run:      run,
 }
 
+func reportf(pass *analysis.Pass, pos token.Pos, format string, args ...any) {
+	if nolint.Suppressed(pass, pos, "nounsafe") {
+		return
+	}
+	pass.Reportf(pos, format, args...)
+}
+
 func run(pass *analysis.Pass) (any, error) {
 	toolver.WarnIfTooNew(pass)
 
@@ -55,7 +64,7 @@ func run(pass *analysis.Pass) (any, error) {
 	// Assembly files are a trust hole equivalent to cgo.
 	for _, other := range pass.OtherFiles {
 		if strings.HasSuffix(strings.ToLower(other), ".s") {
-			pass.Reportf(userFiles[0].Package, "assembly file %q is not verified. Check its safety and the adapter's safety yourself", filepath.Base(other))
+			reportf(pass, userFiles[0].Package, "assembly file %q is not verified. Check its safety and the adapter's safety yourself", filepath.Base(other))
 			break
 		}
 	}
@@ -76,7 +85,7 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 	}
 	if usesCgo {
-		pass.Reportf(userFiles[0].Package, `import "C" (cgo/extern C) is not verified. Check its safety and the adapter's safety yourself`)
+		reportf(pass, userFiles[0].Package, `import "C" (cgo/extern C) is not verified. Check its safety and the adapter's safety yourself`)
 	}
 
 	for _, f := range userFiles {
@@ -95,7 +104,7 @@ func run(pass *analysis.Pass) (any, error) {
 				if cgoSource {
 					continue
 				}
-				pass.Reportf(imp.Pos(), `import "unsafe" is not verified. Check its safety and the adapter's safety yourself`)
+				reportf(pass, imp.Pos(), `import "unsafe" is not verified. Check its safety and the adapter's safety yourself`)
 			case "C":
 				// Already reported at package level when usesCgo; if the AST
 				// still has import "C", report on the import itself instead
@@ -167,9 +176,9 @@ func checkDirectives(pass *analysis.Pass, f *ast.File) {
 			}
 			switch {
 			case name == "linkname":
-				pass.Reportf(c.Pos(), "//go:linkname is not verified. Check its safety and the adapter's safety yourself")
+				reportf(pass, c.Pos(), "//go:linkname is not verified. Check its safety and the adapter's safety yourself")
 			case strings.HasPrefix(name, "cgo_"):
-				pass.Reportf(c.Pos(), "//go:%s is not verified. Check its safety and the adapter's safety yourself", name)
+				reportf(pass, c.Pos(), "//go:%s is not verified. Check its safety and the adapter's safety yourself", name)
 			}
 		}
 	}
@@ -186,6 +195,6 @@ func checkReflectObj(pass *analysis.Pass, id *ast.Ident) {
 	}
 	switch obj.Name() {
 	case "UnsafePointer", "UnsafeAddr", "SliceHeader", "StringHeader":
-		pass.Reportf(id.Pos(), "reflect.%s is not verified. Check its safety and the adapter's safety yourself", obj.Name())
+		reportf(pass, id.Pos(), "reflect.%s is not verified. Check its safety and the adapter's safety yourself", obj.Name())
 	}
 }

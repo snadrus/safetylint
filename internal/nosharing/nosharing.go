@@ -2,8 +2,9 @@
 // channels with freeze-after-send semantics for pointer-carrying values,
 // or via a proven lock/atomic/partition guard (north-star cascade).
 //
-// Provably read-only sharing is allowed. sync.WaitGroup, sync.Once, and
-// sync.Mutex (as a lock object) are whitelisted as pure synchronization.
+// Provably read-only sharing is allowed. sync.WaitGroup, sync.Once,
+// sync.Mutex (as a lock object), and sync/atomic cells are whitelisted as
+// pure synchronization.
 // TryLock/TryRLock only count on paths where their boolean result is proven true.
 //
 // Cross-package: functions that spawn and retain parameters export
@@ -24,6 +25,7 @@ import (
 	"os"
 	"strings"
 
+	"safetylint/internal/nolint"
 	"safetylint/internal/toolver"
 
 	"golang.org/x/tools/go/analysis"
@@ -37,13 +39,25 @@ The nosharing analyzer proves the absence of data races under a channel-only
 sharing discipline, with proven lock / atomic / partition exceptions:
 
   - Memory shared with a goroutine via capture, argument, or global must be
-    provably read-only, be *sync.WaitGroup / *sync.Once / *sync.Mutex, be
+    provably read-only,     be *sync.WaitGroup / *sync.Once / *sync.Mutex / sync/atomic, be
     context.Context / *net/http.Server (stdlib concurrent protocols), or pass
     the guard cascade: tied sync.Mutex field (including Lock/Unlock/RLock/
     RUnlock methods that always wrap that field); free-standing package
     Mutex/RWMutex held at every touch; RWMutex Lock writes / Lock|RLock reads;
-    concurrent touches only via sync/atomic; or const-index partitioned
-    slice/array writers. TryLock/TryRLock only count on proven-true paths.
+    concurrent touches only via sync/atomic; const-index or disjoint-range
+    partitioned slice writers; field-partitioned mutexes (one consistent
+    mutex per field); or exclusive buffer-pool checkout via a token channel.
+    Unlocked reads of fields never written after construction/first-share
+    do not poison the proof. Sharing an object is also OK when every access
+    in the goroutine (and proven callees) is a read of init-frozen data, a
+    tied-mutex access, an atomic, a channel send/recv, or a WaitGroup/Once/
+    Mutex op — init writes before the share do not count. Passing *T into
+    an interface method is not a write of *T unless the method looks like a
+    setter. A method call is not a write of the object if intra-package
+    analysis (or WritesParams) shows the method does not write the receiver
+    except under its mutex / via atomics / channels. TryLock/TryRLock only
+    count on proven-true paths. Unlock-on-cancel helpers and websocket
+    one-reader one-writer pairs are recognized narrowly.
   - Values may transfer between goroutines through channels. If a sent value
     contains pointers, those pointees are frozen after send: no further writes
     through the sender's or receiver's view of that memory are allowed.
@@ -57,9 +71,13 @@ sharing discipline, with proven lock / atomic / partition exceptions:
   - Exported functions that spawn and retain parameters publish MayShareParams
     Facts. Call sites must treat those arguments as shared: no post-call
     writes unless under a proven guard. Wrappers re-export Facts.
-  - Curated async stdlib APIs (time.AfterFunc, http.HandleFunc, …) share
-    closure captures like Fact-bearing calls. Toolchains newer than this
-    tool's verified Go version warn that new standard funcs may be unverified.
+  - Curated async stdlib APIs (time.AfterFunc, http.HandleFunc, …) spawn
+    their callback like go: the body is a goroutine (existing share/lock
+    rules) and passing the closure does not drop the caller's mutex hold.
+    GOROOT callees are not writes unless listed in curatedWriters;
+    curatedRetains is the GOROOT equivalent of MayShareParams (callback
+    slots are spawns, not retains). Toolchains newer than this tool's
+    verified Go version warn that new standard funcs may be unverified.
   - If init starts concurrency, main and other non-init code are already
     post-spawn for global freeze. Globals touched by init goroutines are
     published as package HotGlobals Facts (optional tied mutex). Init
@@ -81,12 +99,18 @@ var Analyzer = &analysis.Analyzer{
 	},
 }
 
+// factsOff is set when FactTypes is cleared (SAFETYLINT_NO_FACTS=1). Kept
+// separate from Analyzer to avoid an initialization cycle (Analyzer.Run
+// eventually calls factsEnabled).
+var factsOff bool
+
 func init() {
 	// SAFETYLINT_NO_FACTS=1 skips FactTypes so unitchecker only analyzes the
 	// packages named on the command line (no SSA of the whole module cache).
 	// Cross-package Facts are unavailable in this mode.
 	if os.Getenv("SAFETYLINT_NO_FACTS") == "1" {
 		Analyzer.FactTypes = nil
+		factsOff = true
 	}
 }
 
@@ -186,11 +210,9 @@ func (a *analyzer) run() {
 		}
 		for _, b := range fn.Blocks {
 			for _, instr := range b.Instrs {
-				goInstr, ok := instr.(*ssa.Go)
-				if !ok {
-					continue
+				if goInstr, ok := instr.(*ssa.Go); ok {
+					a.checkGo(goInstr, fn, globals, reported)
 				}
-				a.checkGo(goInstr, fn, globals, reported)
 			}
 		}
 	}
@@ -202,23 +224,52 @@ func (a *analyzer) run() {
 		a.checkChannelFreeze(fn, reported)
 	}
 
+	// Discover InitOnly helpers even when Facts are off (SAFETYLINT_NO_FACTS):
+	// same-package registry writers like Reg() must still be allowed to
+	// mutate frozen globals. Cross-package InitOnly still needs Facts.
+	a.discoverInitOnlyHelpers()
 	if factsEnabled() {
 		a.exportShareFacts()
 		a.exportInitOnlyFacts()
 		a.exportHotGlobals()
 	}
 	a.checkShareFactCalls(reported)
-	a.checkAsyncCallbackShares(reported)
+	for _, fn := range a.funcs {
+		if fn == nil {
+			continue
+		}
+		a.checkAsyncSpawns(fn, globals, reported)
+	}
 	a.checkInitOnlyCalls(reported)
 	a.checkGlobalFreeze(reported)
 	a.checkHotGlobalAccesses(reported)
 }
 
 func factsEnabled() bool {
-	return os.Getenv("SAFETYLINT_NO_FACTS") != "1"
+	return !factsOff && os.Getenv("SAFETYLINT_NO_FACTS") != "1"
+}
+
+func (a *analyzer) exportObjectFact(obj types.Object, fact analysis.Fact) {
+	if a == nil || a.pass == nil || obj == nil || fact == nil || !factsEnabled() {
+		return
+	}
+	a.pass.ExportObjectFact(obj, fact)
+}
+
+func (a *analyzer) exportPackageFact(fact analysis.Fact) {
+	if a == nil || a.pass == nil || fact == nil || !factsEnabled() {
+		return
+	}
+	a.pass.ExportPackageFact(fact)
 }
 
 func (a *analyzer) reportAt(reported map[string]bool, pos token.Pos, format string, args ...any) {
+	if a == nil || a.pass == nil {
+		return
+	}
+	if nolint.Suppressed(a.pass, pos, "nosharing") {
+		return
+	}
 	msg := fmt.Sprintf(format, args...)
 	key := fmt.Sprintf("%d:%s", pos, msg)
 	if reported[key] {
@@ -234,30 +285,48 @@ func (a *analyzer) checkGo(g *ssa.Go, spawner *ssa.Function, globals map[*ssa.Gl
 		a.reportAt(reported, g.Pos(), "goroutine with non-static callee: cannot prove memory safety")
 		return
 	}
+	var value ssa.Value
+	var args []ssa.Value
+	if c := g.Common(); c != nil {
+		value = c.Value
+		args = c.Args
+	}
 	for _, callee := range callees {
-		a.checkGoCallee(g, spawner, callee, globals, reported)
+		a.checkGoCallee(g, value, args, spawner, callee, globals, reported)
 	}
 }
 
-func (a *analyzer) checkGoCallee(g *ssa.Go, spawner, callee *ssa.Function, globals map[*ssa.Global]bool, reported map[string]bool) {
-	roots := collectRoots(g, callee, globals)
+func (a *analyzer) checkGoCallee(instr ssa.Instruction, value ssa.Value, args []ssa.Value, spawner, callee *ssa.Function, globals map[*ssa.Global]bool, reported map[string]bool) {
+	origRoots := collectRoots(value, args, callee, globals)
 	allFuncs := map[*ssa.Function]bool{}
 	for _, f := range a.funcs {
 		if f != nil {
 			allFuncs[f] = true
 		}
 	}
-	roots = expandRootAliases(roots, allFuncs)
+	roots := expandRootAliases(origRoots, allFuncs)
+	// Peers of this go's arguments/captures only — not every *T that happens
+	// to flow through the same method in this package.
+	thisShare := map[ssa.Value]bool{}
+	for _, o := range origRoots {
+		for _, p := range sameObjectPeersGo(o.val, roots, spawner, instr, allFuncs) {
+			thisShare[p.val] = true
+		}
+	}
+	preShare := a.funcsOnlyCalledBefore(spawner, instr)
 	// Explore the callee's package so cross-package go targets (e.g. s.Run)
 	// still see writes inside the started goroutine.
 	reachable := reachableFuncs(callee, callee.Pkg)
 	seen := map[string]bool{}
 
 	for _, root := range roots {
+		if root.val != nil && len(thisShare) > 0 && !thisShare[root.val] {
+			continue
+		}
 		if isChanType(root.val.Type()) {
 			continue
 		}
-		if isWhitelistedSync(root.val) || isSyncMutex(root.val) || isSyncRWMutex(root.val) || isShareSafeStdlib(root.val) {
+		if isWhitelistedSync(root.val) || isSyncMutex(root.val) || isSyncRWMutex(root.val) || isShareSafeStdlib(root.val) || isHarmonyDBType(root.val.Type()) {
 			// WaitGroup/Once/Mutex/RWMutex objects are pure synchronization.
 			// context.Context and *http.Server are stdlib-safe to share.
 			continue
@@ -273,23 +342,32 @@ func (a *analyzer) checkGoCallee(g *ssa.Go, spawner, callee *ssa.Function, globa
 		}
 
 		writtenInGoro := a.writtenIn(root.val, reachable, true)
-		writtenAfter := isWrittenAfterGo(root.val, spawner, g, a.funcs, reachable)
+		writtenAfter := isWrittenAfterGo(root.val, spawner, instr, a.funcs, reachable)
 		// Struct/array value snapshots captured into a goroutine and only
 		// read there: ignore spawner reassignment of the capture cell
 		// (loop-local map lookups under a lock, Go 1.22+ per-iteration vars).
-		if writtenAfter && !writtenInGoro && valueSnapshotReadOnly(root.val, spawner, g) {
+		if writtenAfter && !writtenInGoro && valueSnapshotReadOnly(root.val, spawner, instr) {
 			writtenAfter = false
 		}
 		// WaitGroup fan-out/join: exclusive ownership of result locals after Wait
 		// (also read-only captures while workers run). Only this root's cell —
 		// not same-type sharePeers — may prove the join (same-type peers are
 		// unrelated locals and would unsoundly silence races).
-		if (writtenInGoro || writtenAfter) && waitGroupExclusiveOK(root.val, spawner, g, reachable) {
+		if (writtenInGoro || writtenAfter) && waitGroupExclusiveOK(root.val, spawner, instr, reachable) {
 			continue
 		}
 		// WaitGroup + free-standing/local mutex during the fan-out; post-Wait
 		// parent access is exclusive (treed_build / apiinfo healthyLk).
-		if (writtenInGoro || writtenAfter) && waitGroupMutexOK(root.val, spawner, g, reachable) {
+		if (writtenInGoro || writtenAfter) && waitGroupMutexOK(root.val, spawner, instr, reachable) {
+			continue
+		}
+		if cancelUnlockerOK(root.val, callee) && !writtenInGoro {
+			continue
+		}
+		if bufferPoolCheckoutOK(root.val, spawner, instr, reachable) {
+			continue
+		}
+		if websocketPairOK(sameObjectPeersGo(root.val, roots, spawner, instr, allFuncs), spawner, instr, reachable) {
 			continue
 		}
 
@@ -303,9 +381,9 @@ func (a *analyzer) checkGoCallee(g *ssa.Go, spawner, callee *ssa.Function, globa
 				continue
 			}
 			// Same-object peers only (not same-type): unrelated *T locals must
-			// not poison the lock proof. Pre-go construction stores in the
-			// spawner are before the share and are ignored.
-			if mutexGuardsGoRootsAfter(sameObjectPeersGo(root.val, roots, spawner, g, allFuncs), allFuncs, spawner, g) {
+			// not poison the lock proof. Pre-go construction / init-helper
+			// stores are before the share and are ignored.
+			if mutexGuardsGoRootsAfter(sameObjectPeersGo(root.val, roots, spawner, instr, allFuncs), allFuncs, spawner, instr, preShare) {
 				for _, r := range roots {
 					seen["write:"+typeKey(r.val)] = true
 				}
@@ -316,7 +394,7 @@ func (a *analyzer) checkGoCallee(g *ssa.Go, spawner, callee *ssa.Function, globa
 				continue
 			}
 			seen[key] = true
-			a.reportAt(reported, g.Pos(), "shared memory %s written without channel transfer and no proven lock/atomic/partition guard (%s)",
+			a.reportAt(reported, instr.Pos(), "shared memory %s written without channel transfer and no proven lock/atomic/partition guard (%s)",
 				root.describe(), root.reason)
 		}
 	}
