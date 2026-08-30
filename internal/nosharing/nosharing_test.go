@@ -129,7 +129,21 @@ func TestNosharing(t *testing.T) {
 		"good_lock_inherit",
 		"good_stack_pool",
 		"good_once_goro",
+		"bad_once_goro_handler",
 		"good_start_gate",
+		"good_cancel_relock",
+		"bad_cancel_relock_write",
+		"good_nested_promise",
+		"bad_nested_promise",
+		"good_chan_event",
+		"bad_chan_event",
+		"good_escape_reg",
+		"bad_escape_reg",
+		"good_affine_pad",
+		"bad_affine_pad",
+		"bad_affine_nowait",
+		"good_watcher_method",
+		"bad_watcher_method",
 	)
 }
 

@@ -43,6 +43,26 @@ func isWrittenInVisiting(pass *analysis.Pass, root ssa.Value, funcs map[*ssa.Fun
 			return true
 		}
 	}
+	// Map field: t1 = *(&root.m); t1[k]=v is not a referrer of &root.m.
+	for fn := range funcs {
+		if fn == nil {
+			continue
+		}
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				mu, ok := instr.(*ssa.MapUpdate)
+				if !ok {
+					continue
+				}
+				if derived[mu.Map] {
+					return true
+				}
+				if fa := mapFieldAddr(mu.Map); fa != nil && derived[fa] {
+					return true
+				}
+			}
+		}
+	}
 	return false
 }
 

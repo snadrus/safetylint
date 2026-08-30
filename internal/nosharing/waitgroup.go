@@ -287,6 +287,74 @@ func closureFreeVarsBoundTo(spawner, closure *ssa.Function, cell ssa.Value) []*s
 	return out
 }
 
+func waitWindowOf(spawner *ssa.Function, g ssa.Instruction) (ssa.Instruction, bool) {
+	if spawner == nil || g == nil {
+		return nil, false
+	}
+	wg := waitGroupOfGo(spawner, g)
+	if wg == nil {
+		return nil, false
+	}
+	wait := findWaitAfter(spawner, g, wg)
+	if wait == nil {
+		wait = findWaitPostDom(spawner, g, wg)
+	}
+	if wait == nil || !waitPostDominatesGo(g, wait) {
+		return nil, false
+	}
+	return wait, true
+}
+
+func findWaitPostDom(fn *ssa.Function, g ssa.Instruction, wg ssa.Value) ssa.Instruction {
+	if fn == nil || g == nil || wg == nil {
+		return nil
+	}
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			call, ok := instr.(*ssa.Call)
+			if !ok || !isWaitGroupMethod(call.Common(), "Wait") {
+				continue
+			}
+			recv := stripToObject(recvOfCall(call.Common()))
+			if recv != wg {
+				continue
+			}
+			if waitPostDominatesGo(g, instr) {
+				return instr
+			}
+		}
+	}
+	return nil
+}
+
+func waitWindowAccesses(accesses []dataAccess, spawner *ssa.Function, g, wait ssa.Instruction, goro map[*ssa.Function]bool) []dataAccess {
+	_ = goro
+	var out []dataAccess
+	for _, acc := range accesses {
+		if acc.instr == nil {
+			continue
+		}
+		fn := acc.instr.Parent()
+		if fn == nil {
+			continue
+		}
+		if fn != spawner {
+			out = append(out, acc)
+			continue
+		}
+		// Parent: drop happens-before this go and happens-after Wait.
+		// Loop-body gos do not dominate the after-loop / before-Wait writes.
+		if dominatesInstr(acc.instr, g) {
+			continue
+		}
+		if dominatesInstr(wait, acc.instr) {
+			continue
+		}
+		out = append(out, acc)
+	}
+	return out
+}
+
 func waitGroupOfGo(fn *ssa.Function, g ssa.Instruction) ssa.Value {
 	var wg ssa.Value
 	for _, b := range fn.Blocks {
@@ -334,6 +402,76 @@ func isWaitGroupMethod(c *ssa.CallCommon, name string) bool {
 	}
 	recv := recvOfCall(c)
 	return recv != nil && isNamedSyncType(recv.Type(), "WaitGroup")
+}
+
+// waitPostDominatesGo reports that every path from g to a function exit
+// visits wait. Loops that eventually exit through wait are allowed; an
+// early return that skips wait fails closed (treed_build).
+func waitPostDominatesGo(g, wait ssa.Instruction) bool {
+	if g == nil || wait == nil || g.Parent() != wait.Parent() {
+		return false
+	}
+	gb, wb := g.Block(), wait.Block()
+	if gb == nil || wb == nil {
+		return false
+	}
+	if gb == wb {
+		return instrIndex(gb, g) < instrIndex(wb, wait)
+	}
+	if !canReachBlock(gb, wb) {
+		return false
+	}
+	return !canReachExitAvoiding(gb, wb)
+}
+
+func canReachBlock(from, to *ssa.BasicBlock) bool {
+	if from == nil || to == nil {
+		return false
+	}
+	if from == to {
+		return true
+	}
+	seen := map[*ssa.BasicBlock]bool{from: true}
+	q := []*ssa.BasicBlock{from}
+	for len(q) > 0 {
+		cur := q[0]
+		q = q[1:]
+		for _, s := range cur.Succs {
+			if s == to {
+				return true
+			}
+			if s == nil || seen[s] {
+				continue
+			}
+			seen[s] = true
+			q = append(q, s)
+		}
+	}
+	return false
+}
+
+func canReachExitAvoiding(start, avoid *ssa.BasicBlock) bool {
+	if start == nil || avoid == nil || start == avoid {
+		return false
+	}
+	if len(start.Succs) == 0 {
+		return true
+	}
+	seen := map[*ssa.BasicBlock]bool{start: true, avoid: true}
+	q := append([]*ssa.BasicBlock{}, start.Succs...)
+	for len(q) > 0 {
+		cur := q[0]
+		q = q[1:]
+		if cur == nil || cur == avoid || seen[cur] {
+			continue
+		}
+		if len(cur.Succs) == 0 {
+			return true
+		}
+		seen[cur] = true
+		q = append(q, cur.Succs...)
+	}
+	return false
 }
 
 func dominatesInstr(a, b ssa.Instruction) bool {

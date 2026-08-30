@@ -23,7 +23,7 @@ func affineRangePartitionOK(root ssa.Value, accesses []dataAccess) bool {
 			return false
 		}
 		if !acc.write {
-			return false
+			continue
 		}
 		sl := sliceOfAccess(acc)
 		if sl == nil {
@@ -67,10 +67,10 @@ func affineMulBounds(sl *ssa.Slice) (idx ssa.Value, k int64, ok bool) {
 	if !ok || stride <= 0 {
 		return nil, 0, false
 	}
-	if hi, k2, ok := asMulConst(peelMin(sl.High)); ok && k2 == stride && sameIndexVal(hi, plusOne(base)) {
+	if hi, k2, ok := asMulConst(peelMin(sl.High)); ok && k2 == stride && isPlusOneOf(hi, base) {
 		return peelIndex(base), stride, true
 	}
-	if hi, k2, ok := asMulConst(sl.High); ok && k2 == stride && sameIndexVal(hi, plusOne(base)) {
+	if hi, k2, ok := asMulConst(sl.High); ok && k2 == stride && isPlusOneOf(hi, base) {
 		return peelIndex(base), stride, true
 	}
 	// high = low + K
@@ -124,6 +124,26 @@ func asMulConst(v ssa.Value) (idx ssa.Value, k int64, ok bool) {
 		return peelConv(bin.Y), c, true
 	}
 	return nil, 0, false
+}
+
+func isPlusOneOf(hi, base ssa.Value) bool {
+	if hi == nil || base == nil {
+		return false
+	}
+	if sameIndexVal(hi, plusOne(base)) {
+		return true
+	}
+	add, ok := peelConv(hi).(*ssa.BinOp)
+	if !ok || add.Op != token.ADD {
+		return false
+	}
+	if c, yes := constIntVal(add.Y); yes && c == 1 && sameIndexVal(add.X, base) {
+		return true
+	}
+	if c, yes := constIntVal(add.X); yes && c == 1 && sameIndexVal(add.Y, base) {
+		return true
+	}
+	return false
 }
 
 func plusOne(v ssa.Value) ssa.Value {
@@ -316,23 +336,26 @@ func siblingEndFree(start *ssa.FreeVar) ssa.Value {
 }
 
 func affineSpansDisjoint(spans []ownedAffine) bool {
-	// Pairwise: same K, and [start,end) come from w*C / min((w+1)*C,n)
-	// captured at different go sites, or distinct const ranges.
-	if len(spans) < 2 {
-		return true
+	// Fail closed unless every (start,end) binding recovers as an affine
+	// worker split. One function/closure is not enough by itself.
+	if len(spans) == 0 {
+		return false
 	}
 	k := spans[0].k
-	for _, s := range spans[1:] {
+	var pairs []affinePair
+	for _, s := range spans {
 		if s.k != k {
 			return false
 		}
-	}
-	var pairs []affinePair
-	for _, s := range spans {
+		b := parseAffineBind(s.start, s.end)
+		if !b.ok {
+			return false
+		}
 		pairs = append(pairs, affinePair{s.start, s.end})
 	}
-	// Distinct captured (start,end) params/freevars: prove they came from
-	// affine disjoint worker splits in the same spawner.
+	if len(pairs) == 1 {
+		return true
+	}
 	return capturedRangesDisjoint(pairs)
 }
 
@@ -403,8 +426,8 @@ func parseAffineBind(start, end ssa.Value) (out struct {
 	if sv == nil || ev == nil {
 		return out
 	}
-	// start = w * C
-	wval, c, ok := asMulConst(sv)
+	// start = w * C (C const or loop-invariant)
+	wval, stride, c, ok := asMulStride(sv)
 	if !ok {
 		// start may be the loop index itself (C=1): start=w, end=w+1 or min(w+1,n)
 		if wc, yes := constIntVal(sv); yes {
@@ -415,7 +438,6 @@ func parseAffineBind(start, end ssa.Value) (out struct {
 			if plusOne(peelMin(ev)) != nil && sameIndexVal(plusOne(peelMin(ev)), sv) {
 				return out
 			}
-			// end = (w+1)*1 still OK if end is w+1
 			if add, yes := peelMin(ev).(*ssa.BinOp); yes && add.Op == token.ADD {
 				if c, yes := constIntVal(add.Y); yes && c == 1 && sameIndexVal(add.X, sv) {
 					return out
@@ -430,20 +452,68 @@ func parseAffineBind(start, end ssa.Value) (out struct {
 	if wc, yes := constIntVal(wval); yes {
 		out.w = wc
 		out.ok = true
-		// end should be (w+1)*C or min((w+1)*C, n)
-		want, _, ok2 := asMulConst(peelMin(ev))
-		if ok2 && sameIndexVal(want, plusOne(wval)) {
+		want, _, c2, ok2 := asMulStride(peelMin(ev))
+		if ok2 && sameStride(stride, c, c2) && sameIndexVal(want, plusOne(wval)) {
 			return out
 		}
-		if hc, yes := constIntVal(peelMin(ev)); yes && hc == (wc+1)*c {
+		if hc, yes := constIntVal(peelMin(ev)); yes && c > 0 && hc == (wc+1)*c {
 			return out
 		}
 		out.ok = false
 		return out
 	}
 	out.symW = peelConv(wval)
+	want, _, c2, ok2 := asMulStride(peelMin(ev))
+	if !ok2 || !sameStride(stride, c, c2) {
+		out.ok = false
+		return out
+	}
+	if !sameIndexVal(want, plusOne(wval)) && plusOne(want) != peelConv(wval) && !sameIndexVal(plusOne(peelConv(wval)), want) {
+		out.ok = false
+		return out
+	}
 	out.ok = true
 	return out
+}
+
+func sameStride(stride ssa.Value, c1, c2 int64) bool {
+	if c1 > 0 && c2 > 0 {
+		return c1 == c2
+	}
+	if stride == nil {
+		return c1 == c2
+	}
+	return true
+}
+
+// asMulStride reports v is idx*stride. stride may be a positive const (k>0)
+// or a loop-invariant SSA value (k==0).
+func asMulStride(v ssa.Value) (idx, stride ssa.Value, k int64, ok bool) {
+	if idx0, c, yes := asMulConst(v); yes {
+		return idx0, nil, c, true
+	}
+	v = peelConv(v)
+	bin, yes := v.(*ssa.BinOp)
+	if !yes || bin.Op != token.MUL {
+		return nil, nil, 0, false
+	}
+	x, y := peelConv(bin.X), peelConv(bin.Y)
+	if indexLike(x) {
+		return x, y, 0, true
+	}
+	if indexLike(y) {
+		return y, x, 0, true
+	}
+	return x, y, 0, true
+}
+
+func indexLike(v ssa.Value) bool {
+	v = peelConv(v)
+	switch v.(type) {
+	case *ssa.Phi, *ssa.Parameter, *ssa.FreeVar:
+		return true
+	}
+	return plusOne(v) != nil
 }
 
 func bindDef(v ssa.Value) ssa.Value {

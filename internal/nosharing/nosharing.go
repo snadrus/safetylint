@@ -400,6 +400,7 @@ func (a *analyzer) checkGoCallee(instr ssa.Instruction, value ssa.Value, args []
 			// Same-object peers only (not same-type). Own-field accesses;
 			// constructor / pre-go stores and other-field sibling writes ignored.
 			peers := sameObjectPeersGo(root.val, roots, spawner, instr, allFuncs)
+			peers = appendShareAliases(peers, root.val, allFuncs)
 			if objectGuardedOwnRootsAfter(peers, allFuncs, spawner, instr, preShare, reachable) {
 				for _, r := range roots {
 					seen["write:"+typeKey(r.val)] = true
@@ -430,6 +431,23 @@ func (r sharedRoot) describe() string {
 		return fmt.Sprintf("%s (%s)", n.Name(), r.val.Type())
 	}
 	return r.val.String()
+}
+
+func appendShareAliases(peers []sharedRoot, focus ssa.Value, funcs map[*ssa.Function]bool) []sharedRoot {
+	seen := map[ssa.Value]bool{}
+	for _, p := range peers {
+		if p.val != nil {
+			seen[p.val] = true
+		}
+	}
+	for _, x := range siblingShareAliases(focus, funcs) {
+		if x == nil || seen[x] {
+			continue
+		}
+		seen[x] = true
+		peers = append(peers, sharedRoot{val: x, reason: "share alias"})
+	}
+	return peers
 }
 
 func staticCallee(c *ssa.CallCommon) *ssa.Function {

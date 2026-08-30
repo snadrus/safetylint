@@ -678,6 +678,9 @@ func sliceOfAccess(acc dataAccess) *ssa.Slice {
 	if sl, ok := acc.addr.(*ssa.Slice); ok {
 		return sl
 	}
+	if sl := peelPadCopyDest(acc); sl != nil {
+		return sl
+	}
 	cur := acc.addr
 	if st, ok := acc.instr.(*ssa.Store); ok {
 		cur = st.Addr
@@ -705,6 +708,51 @@ func sliceOfAccess(acc dataAccess) *ssa.Slice {
 		}
 	}
 	return nil
+}
+
+func peelPadCopyDest(acc dataAccess) *ssa.Slice {
+	if sl, ok := acc.addr.(*ssa.Slice); ok {
+		return sl
+	}
+	var c *ssa.CallCommon
+	switch in := acc.instr.(type) {
+	case *ssa.Call:
+		c = in.Common()
+	case *ssa.Defer:
+		c = in.Common()
+	default:
+		return nil
+	}
+	if c == nil {
+		return nil
+	}
+	cal := c.StaticCallee()
+	if cal != nil && isSrcFirstSliceCopy(cal) {
+		first := firstSliceArgIndex(c)
+		for i, arg := range c.Args {
+			if i == first || arg == nil {
+				continue
+			}
+			if sl := sliceOfValue(arg); sl != nil {
+				return sl
+			}
+		}
+	}
+	if !c.IsInvoke() {
+		if b, ok := c.Value.(*ssa.Builtin); ok && b.Name() == "copy" && len(c.Args) >= 1 {
+			if sl := sliceOfValue(c.Args[0]); sl != nil {
+				return sl
+			}
+		}
+	}
+	return sliceOfValue(acc.addr)
+}
+
+func sliceOfValue(v ssa.Value) *ssa.Slice {
+	if sl, ok := v.(*ssa.Slice); ok {
+		return sl
+	}
+	return sliceDef(v)
 }
 
 func sliceDef(v ssa.Value) *ssa.Slice {

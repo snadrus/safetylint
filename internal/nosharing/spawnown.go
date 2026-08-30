@@ -18,6 +18,7 @@ func (a *analyzer) spawnShareScope(spawner, callee *ssa.Function, g ssa.Instruct
 		scope[spawner] = true
 	}
 	cells := spawnCells(origRoots, spawner, g)
+	a.addRetainedMethodValues(scope, cells)
 	for _, fn := range a.funcs {
 		if fn == nil {
 			continue
@@ -77,6 +78,68 @@ func spawnCells(roots []sharedRoot, spawner *ssa.Function, g ssa.Instruction) ma
 	return cells
 }
 
+// addRetainedMethodValues treats a method-value of a shared cell passed to a
+// call as a sibling share (AddWatcher(t.onHead)). The method body joins the
+// spawn scope; it is not itself a new go.
+func (a *analyzer) addRetainedMethodValues(scope map[*ssa.Function]bool, cells map[ssa.Value]bool) {
+	if a == nil || len(cells) == 0 {
+		return
+	}
+	for _, fn := range a.funcs {
+		if fn == nil {
+			continue
+		}
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				var args []ssa.Value
+				switch in := instr.(type) {
+				case *ssa.Call:
+					if c := in.Common(); c != nil {
+						args = c.Args
+					}
+				case *ssa.Defer:
+					if c := in.Common(); c != nil {
+						args = c.Args
+					}
+				case *ssa.Store:
+					args = []ssa.Value{in.Val}
+				default:
+					continue
+				}
+				for _, arg := range args {
+					mc, ok := arg.(*ssa.MakeClosure)
+					if !ok {
+						continue
+					}
+					cal, _ := mc.Fn.(*ssa.Function)
+					if cal == nil {
+						continue
+					}
+					if !closureBindsCells(mc, cells) {
+						continue
+					}
+					scope[cal] = true
+					for f := range reachableFuncs(cal, cal.Pkg) {
+						scope[f] = true
+					}
+				}
+			}
+		}
+	}
+}
+
+func closureBindsCells(mc *ssa.MakeClosure, cells map[ssa.Value]bool) bool {
+	if mc == nil || len(cells) == 0 {
+		return false
+	}
+	for _, bind := range mc.Bindings {
+		if cells[bind] || cells[stripToObject(bind)] {
+			return true
+		}
+	}
+	return false
+}
+
 func spawnCellsOverlap(a, b map[ssa.Value]bool) bool {
 	for v := range a {
 		if b[v] {
@@ -87,7 +150,9 @@ func spawnCellsOverlap(a, b map[ssa.Value]bool) bool {
 }
 
 // isChanValueCopy reports a channel-received or channel-sent struct value
-// copy. Those are not shared heap roots (*schedulerEvent sent by value).
+// copy. Those are not shared heap roots. Structs with map/slice fields are
+// accepted when the alloc is only stored from recv (pointees stay frozen
+// via checkChannelFreeze).
 func isChanValueCopy(v ssa.Value) bool {
 	if v == nil {
 		return false
@@ -453,14 +518,20 @@ func collectOwnDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []data
 				case *ssa.MapUpdate:
 					if derived[in.Map] {
 						add(in, in.Map, true)
+					} else if fa := mapFieldAddr(in.Map); fa != nil && derived[fa] {
+						add(in, fa, true)
 					}
 				case *ssa.Lookup:
 					if derived[in.X] {
 						add(in, in.X, false)
+					} else if fa := mapFieldAddr(in.X); fa != nil && derived[fa] {
+						add(in, fa, false)
 					}
 				case *ssa.Range:
 					if derived[in.X] {
 						add(in, in.X, false)
+					} else if fa := mapFieldAddr(in.X); fa != nil && derived[fa] {
+						add(in, fa, false)
 					}
 				case *ssa.Call:
 					checkCall(in, in.Common())
@@ -473,6 +544,19 @@ func collectOwnDataAccesses(root ssa.Value, funcs map[*ssa.Function]bool) []data
 		}
 	}
 	return out
+}
+
+func mapFieldAddr(m ssa.Value) *ssa.FieldAddr {
+	if m == nil {
+		return nil
+	}
+	if u, ok := m.(*ssa.UnOp); ok && u.Op == token.MUL {
+		if fa, ok := u.X.(*ssa.FieldAddr); ok {
+			return fa
+		}
+		return fieldAddrOf(u.X)
+	}
+	return fieldAddrOf(m)
 }
 
 func objectGuardedOwnRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool, spawner *ssa.Function, g ssa.Instruction, preShare map[*ssa.Function]bool, goro map[*ssa.Function]bool) bool {
@@ -504,7 +588,7 @@ func objectGuardedOwnRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool
 			if fn != nil && goro[fn] {
 				if k, ok := fieldIndexOf(acc); ok {
 					thisFields[k] = true
-				} else if !isObjectInitStore(acc) && !isShareSafeFieldStore(acc) {
+				} else if !isObjectInitStore(acc) && !isShareSafeFieldStore(acc) && !isNestedShareSafeAccess(acc) {
 					thisWhole = true
 				}
 			}
@@ -573,8 +657,14 @@ func objectGuardedOwnRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool
 	if len(dataRoots) > 0 && constIndexPartitionOK(dataRoots[0], accesses) {
 		return true
 	}
-	if len(dataRoots) > 0 && (rangePartitionOK(dataRoots[0], accesses) || affineRangePartitionOK(dataRoots[0], accesses)) {
+	if len(dataRoots) > 0 && rangePartitionOK(dataRoots[0], accesses) {
 		return true
+	}
+	if wait, ok := waitWindowOf(spawner, g); ok {
+		partAcc := waitWindowAccesses(accesses, spawner, g, wait, goro)
+		if len(dataRoots) > 0 && affineRangePartitionOK(dataRoots[0], partAcc) {
+			return true
+		}
 	}
 	if len(dataRoots) > 0 && fieldPartitionedGuards(dataRoots[0], accesses, funcs) {
 		return true
@@ -599,6 +689,12 @@ func objectGuardedOwnRootsAfter(roots []sharedRoot, funcs map[*ssa.Function]bool
 		}
 		if atomicsOnlyAccesses(rAcc) {
 			continue
+		}
+		if wait, ok := waitWindowOf(spawner, g); ok {
+			rPart := waitWindowAccesses(rAcc, spawner, g, wait, goro)
+			if affineRangePartitionOK(r, rPart) {
+				continue
+			}
 		}
 		if fieldPartitionedGuards(r, rAcc, funcs) {
 			continue
@@ -642,9 +738,38 @@ func isWrittenAfterGoScoped(root ssa.Value, spawner *ssa.Function, g ssa.Instruc
 		if isWrittenIn(root, map[*ssa.Function]bool{f: true}, true) {
 			return true
 		}
+		for _, alias := range siblingShareAliases(root, share) {
+			if isWrittenIn(alias, map[*ssa.Function]bool{f: true}, true) {
+				return true
+			}
+		}
 	}
 	_ = preShare
 	return hasWriteNotBefore(root, spawner, g)
+}
+
+// siblingShareAliases is the method-value / returned-pointer views of root
+// that may be written after go without naming root's SSA value.
+func siblingShareAliases(root ssa.Value, funcs map[*ssa.Function]bool) []ssa.Value {
+	if root == nil {
+		return nil
+	}
+	seen := map[ssa.Value]bool{root: true}
+	var out []ssa.Value
+	add := func(v ssa.Value) {
+		if v == nil || seen[v] {
+			return
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	for _, x := range methodValueAliases(root, funcs) {
+		add(x)
+	}
+	for _, x := range returnValueAliases(root, funcs) {
+		add(x)
+	}
+	return out
 }
 
 func ctorHasPostShareWrite(root ssa.Value, ctor, spawner *ssa.Function, g ssa.Instruction) bool {

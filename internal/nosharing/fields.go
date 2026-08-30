@@ -7,9 +7,10 @@ import (
 	"golang.org/x/tools/go/ssa"
 )
 
-// fieldIndexOf reports the outermost struct field of acc, if the access is
-// through a FieldAddr of a named/anonymous struct. Whole-object accesses
-// (the object pointer itself) return ok=false.
+// fieldIndexOf reports the innermost named struct field of acc (the FieldAddr
+// closest to the accessed cell). Embedded-field chains (r.MachineID through
+// an anonymous Resources) use MachineID's index, not the outermost embed.
+// Whole-object accesses return ok=false.
 func fieldIndexOf(acc dataAccess) (int, bool) {
 	return fieldIndexOfAddr(acc.addr)
 }
@@ -19,7 +20,7 @@ func fieldIndexOfAddr(addr ssa.Value) (int, bool) {
 	for cur != nil {
 		switch v := cur.(type) {
 		case *ssa.FieldAddr:
-			return outermostFieldIndex(v)
+			return v.Field, true
 		case *ssa.UnOp:
 			if v.Op == token.MUL {
 				cur = v.X
@@ -32,26 +33,6 @@ func fieldIndexOfAddr(addr ssa.Value) (int, bool) {
 			cur = v.X
 		default:
 			return 0, false
-		}
-	}
-	return 0, false
-}
-
-func outermostFieldIndex(fa *ssa.FieldAddr) (int, bool) {
-	for fa != nil {
-		switch x := fa.X.(type) {
-		case *ssa.FieldAddr:
-			fa = x
-		case *ssa.UnOp:
-			if x.Op == token.MUL {
-				if inner, ok := x.X.(*ssa.FieldAddr); ok {
-					fa = inner
-					continue
-				}
-			}
-			return fa.Field, true
-		default:
-			return fa.Field, true
 		}
 	}
 	return 0, false
@@ -128,7 +109,7 @@ func dropFrozenFieldReads(accesses []dataAccess) []dataAccess {
 		if !acc.write {
 			continue
 		}
-		if isObjectInitStore(acc) || isShareSafeFieldStore(acc) {
+		if isObjectInitStore(acc) || isShareSafeFieldStore(acc) || isNestedShareSafeAccess(acc) {
 			continue
 		}
 		if k, ok := fieldIndexOf(acc); ok {
@@ -177,6 +158,7 @@ func dropChanFieldReads(accesses []dataAccess) []dataAccess {
 
 func prepareGuardAccesses(accesses []dataAccess) []dataAccess {
 	accesses = dropSetupAccesses(accesses)
+	accesses = dropNestedShareSafeAccesses(accesses)
 	accesses = dropFrozenFieldReads(accesses)
 	accesses = dropChanFieldReads(accesses)
 	return accesses

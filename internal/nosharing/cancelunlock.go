@@ -73,11 +73,18 @@ func cancelUnlockerCallOK(c *ssa.CallCommon, sawRecv, sawUnlock *bool) bool {
 	}
 	if isMutexGuardCall(c) {
 		name := mutexMethodName(c)
-		if name == "Unlock" || name == "RUnlock" {
+		switch name {
+		case "Unlock", "RUnlock":
 			*sawUnlock = true
+			return true
+		case "Lock", "RLock":
+			// Relock after cancel: parent released, helper re-acquires.
 			return true
 		}
 		return false
+	}
+	if isCondBookkeepingCall(c) {
+		return true
 	}
 	if !c.IsInvoke() {
 		if _, ok := c.Value.(*ssa.Builtin); ok {
@@ -106,6 +113,9 @@ func cancelUnlockerCallOK(c *ssa.CallCommon, sawRecv, sawUnlock *bool) bool {
 		*sawUnlock = true
 		return true
 	}
+	if name == "Lock" || name == "RLock" || name == "lock" {
+		return true
+	}
 	// Builtin delete of the lock map; lock-object unlock helpers.
 	if !c.IsInvoke() {
 		if b, ok := c.Value.(*ssa.Builtin); ok && b.Name() == "delete" {
@@ -123,13 +133,34 @@ func isLockBookkeepingAddr(addr ssa.Value) bool {
 		st := structOf(fa.X.Type())
 		if st != nil && fa.Field >= 0 && fa.Field < st.NumFields() {
 			switch st.Field(fa.Field).Name() {
-			case "refs", "ref", "Locks", "locks":
+			case "refs", "ref", "Locks", "locks", "r", "w":
 				return true
 			}
 		}
 	}
 	if typeIsMap(addr.Type()) {
 		return true
+	}
+	return false
+}
+
+func isCondBookkeepingCall(c *ssa.CallCommon) bool {
+	if c == nil {
+		return false
+	}
+	name := mutexMethodName(c)
+	switch name {
+	case "Broadcast", "Signal", "Wait":
+	default:
+		return false
+	}
+	recv := recvOfCall(c)
+	if recv != nil && isNamedSyncType(recv.Type(), "Cond") {
+		return true
+	}
+	cal := c.StaticCallee()
+	if cal != nil && cal.Signature != nil && cal.Signature.Recv() != nil {
+		return isNamedSyncType(cal.Signature.Recv().Type(), "Cond")
 	}
 	return false
 }
@@ -159,7 +190,7 @@ func hasNonBookkeepingWrite(root ssa.Value, fn *ssa.Function) bool {
 		if !acc.write {
 			continue
 		}
-		if isLockBookkeepingAddr(acc.addr) || isMutexFieldAddr(acc.addr) {
+		if isLockBookkeepingAddr(acc.addr) || isMutexFieldAddr(acc.addr) || isNestedShareSafeAccess(acc) {
 			continue
 		}
 		if isObjectInitStore(acc) {

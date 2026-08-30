@@ -3,6 +3,7 @@ package nosharing
 import (
 	"go/token"
 	"go/types"
+	"strings"
 
 	"golang.org/x/tools/go/ssa"
 )
@@ -244,7 +245,7 @@ func sameObjectPeersGo(focus ssa.Value, roots []sharedRoot, spawner *ssa.Functio
 	}
 	// Also synthesize peers for aliased Parameters/Allocs not already in roots
 	// so their accesses join the mutex proof.
-	for c := range cells {
+		for c := range cells {
 		switch c.(type) {
 		case *ssa.Parameter, *ssa.Alloc, *ssa.FreeVar:
 			addRoot(sharedRoot{val: c, reason: "alias"})
@@ -412,6 +413,187 @@ func goParamBindings(g ssa.Instruction, focus ssa.Value) []ssa.Value {
 	return []ssa.Value{cell}
 }
 
+// methodValueAliases returns the bound-method FreeVar and the underlying
+// method receiver when a MakeClosure binds cell (t.onHead retained by
+// AddWatcher). Bound wrappers are synthetic (Pkg==nil) and must be chased
+// to the real method Parameter.
+func methodValueAliases(cell ssa.Value, funcs map[*ssa.Function]bool) []ssa.Value {
+	if cell == nil {
+		return nil
+	}
+	obj := stripToObject(cell)
+	if obj == nil {
+		obj = cell
+	}
+	var out []ssa.Value
+	seen := map[ssa.Value]bool{}
+	add := func(v ssa.Value) {
+		if v == nil || seen[v] {
+			return
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	scan := func(fn *ssa.Function) {
+		if fn == nil {
+			return
+		}
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				mc, ok := instr.(*ssa.MakeClosure)
+				if !ok {
+					continue
+				}
+				if !closureBindsValue(mc, cell, obj) {
+					continue
+				}
+				cal, _ := mc.Fn.(*ssa.Function)
+				if cal == nil {
+					continue
+				}
+				for _, fv := range cal.FreeVars {
+					add(fv)
+				}
+				isBound := strings.HasSuffix(cal.Name(), "$bound")
+				isMethodVal := cal.Signature != nil && cal.Signature.Recv() != nil && len(mc.Bindings) > 0
+				if !isBound && !isMethodVal {
+					continue
+				}
+				if cal.Signature != nil && cal.Signature.Recv() != nil && len(cal.Params) > 0 {
+					add(cal.Params[0])
+				}
+				// Bound wrappers are synthetic: chase the immediate method
+				// they call, not the whole reachable *T method set.
+				if !isBound {
+					continue
+				}
+				for _, b := range cal.Blocks {
+					for _, in := range b.Instrs {
+						call, ok := in.(*ssa.Call)
+						if !ok {
+							continue
+						}
+						f := call.Common().StaticCallee()
+						if f == nil || f.Signature == nil || f.Signature.Recv() == nil || len(f.Params) == 0 {
+							continue
+						}
+						add(f.Params[0])
+					}
+				}
+			}
+		}
+	}
+	for fn := range funcs {
+		scan(fn)
+	}
+	return out
+}
+
+func closureBindsValue(mc *ssa.MakeClosure, cell, obj ssa.Value) bool {
+	if mc == nil {
+		return false
+	}
+	for _, bind := range mc.Bindings {
+		if bind == cell || bind == obj || stripToObject(bind) == cell || stripToObject(bind) == obj {
+			return true
+		}
+	}
+	return false
+}
+
+// returnValueAliases reports Call results of functions that return cell
+// (start() returning the spawned *Task; New() returning *Replacer).
+func returnValueAliases(cell ssa.Value, funcs map[*ssa.Function]bool) []ssa.Value {
+	if cell == nil {
+		return nil
+	}
+	obj := stripToObject(cell)
+	if obj == nil {
+		return nil
+	}
+	retFns := map[*ssa.Function]bool{}
+	for fn := range funcs {
+		if fn == nil {
+			continue
+		}
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				ret, ok := instr.(*ssa.Return)
+				if !ok {
+					continue
+				}
+				for _, r := range ret.Results {
+					if r == cell || r == obj || stripToObject(r) == cell || stripToObject(r) == obj {
+						if functionSpawnsCell(fn, cell, obj) {
+							retFns[fn] = true
+						}
+					}
+				}
+			}
+		}
+	}
+	if len(retFns) == 0 {
+		return nil
+	}
+	var out []ssa.Value
+	seen := map[ssa.Value]bool{}
+	add := func(v ssa.Value) {
+		if v == nil || seen[v] {
+			return
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	for fn := range funcs {
+		if fn == nil {
+			continue
+		}
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				call, ok := instr.(*ssa.Call)
+				if !ok {
+					continue
+				}
+				cal := call.Common().StaticCallee()
+				if cal == nil || !retFns[cal] {
+					if cal != nil && cal.Origin() != nil && retFns[cal.Origin()] {
+						add(call)
+					}
+					continue
+				}
+				add(call)
+			}
+		}
+	}
+	return out
+}
+
+func functionSpawnsCell(fn *ssa.Function, cell, obj ssa.Value) bool {
+	if fn == nil {
+		return false
+	}
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			g, ok := instr.(*ssa.Go)
+			if !ok || g.Common() == nil {
+				continue
+			}
+			c := g.Common()
+			for _, arg := range c.Args {
+				if arg == cell || arg == obj || stripToObject(arg) == cell || stripToObject(arg) == obj {
+					return true
+				}
+			}
+			if mc, ok := c.Value.(*ssa.MakeClosure); ok {
+				if closureBindsValue(mc, cell, obj) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // expandRootAliases grows roots to every same-package SSA name for the same
 // shareable objects: allocation sites, parameters that may receive them,
 // free vars and their bindings. Needed so a tied-mutex proof sees every
@@ -478,6 +660,16 @@ func expandRootAliases(roots []sharedRoot, funcs map[*ssa.Function]bool) []share
 							add(fv, "alias of shared capture")
 							add(bind, "alias of shared capture")
 							add(stripToObject(bind), "alias of shared capture")
+						}
+						// Method-value: MakeClosure binds recv to the method
+						// Parameter, not a FreeVar (t.processHeadChange).
+						if f.Signature != nil && f.Signature.Recv() != nil && len(in.Bindings) > 0 && len(f.Params) > 0 {
+							bind := in.Bindings[0]
+							if seen[bind] || seen[stripToObject(bind)] {
+								add(f.Params[0], "method-value receiver")
+								add(bind, "method-value receiver")
+								add(stripToObject(bind), "method-value receiver")
+							}
 						}
 						continue
 					default:

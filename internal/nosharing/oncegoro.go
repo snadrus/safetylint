@@ -1,16 +1,24 @@
 package nosharing
 
-import "golang.org/x/tools/go/ssa"
+import (
+	"go/types"
+
+	"golang.org/x/tools/go/ssa"
+)
 
 // singleGoroOwnOK reports that every own field this goroutine writes is
-// written only from this goroutine (plus constructor / pre-share). A
-// Once.Do that wraps the go plus a one-time rewrite that dominates the
-// rest of the goroutine body is treated as freeze-after-start.
+// exclusive to this goroutine (plus constructor / pre-share). A Once.Do
+// that wraps the go is required. Loops are allowed: exclusivity is
+// "no sibling go / other post-share func reads or writes those fields",
+// not dominate-body.
 func singleGoroOwnOK(root ssa.Value, spawner *ssa.Function, g ssa.Instruction, goro, allFuncs map[*ssa.Function]bool, ctor *ssa.Function, preShare map[*ssa.Function]bool) bool {
 	if root == nil || len(goro) == 0 || !onceWrapsGo(spawner, g) {
 		return false
 	}
-	goroAcc := collectOwnDataAccesses(root, goro)
+	var goroAcc []dataAccess
+	for f := range goro {
+		goroAcc = append(goroAcc, collectOwnAndRecvAccesses(root, f)...)
+	}
 	written := map[int]bool{}
 	whole := false
 	for _, acc := range goroAcc {
@@ -19,14 +27,14 @@ func singleGoroOwnOK(root ssa.Value, spawner *ssa.Function, g ssa.Instruction, g
 		}
 		if k, ok := fieldIndexOf(acc); ok {
 			written[k] = true
-		} else if !isObjectInitStore(acc) && !isShareSafeFieldStore(acc) {
+		} else if !isObjectInitStore(acc) && !isShareSafeFieldStore(acc) && !isNestedShareSafeAccess(acc) {
 			whole = true
 		}
 	}
 	if !whole && len(written) == 0 {
 		return false
 	}
-	if siblingGoWritesFields(root, g, allFuncs, written, whole) {
+	if siblingGoTouchesFields(root, g, allFuncs, written, whole) {
 		return false
 	}
 	for f := range allFuncs {
@@ -36,11 +44,11 @@ func singleGoroOwnOK(root ssa.Value, spawner *ssa.Function, g ssa.Instruction, g
 		if f == spawner {
 			continue
 		}
-		for _, acc := range collectOwnDataAccesses(root, map[*ssa.Function]bool{f: true}) {
-			if !acc.write {
+		for _, acc := range collectOwnAndRecvAccesses(root, f) {
+			if skipSpawnPreShare(acc, spawner, g, preShare, ctor) {
 				continue
 			}
-			if skipSpawnPreShare(acc, spawner, g, preShare, ctor) {
+			if isNestedShareSafeAccess(acc) || isObjectInitStore(acc) || isShareSafeFieldStore(acc) {
 				continue
 			}
 			if whole {
@@ -50,14 +58,10 @@ func singleGoroOwnOK(root ssa.Value, spawner *ssa.Function, g ssa.Instruction, g
 			if isField && written[k] {
 				return false
 			}
-			if !isField && !isObjectInitStore(acc) {
+			if !isField && acc.write {
 				return false
 			}
 		}
-	}
-	// Once.Do wrapping go: one-time rewrite at goro start is freeze.
-	if onceWrapsGo(spawner, g) {
-		return goroWritesDominateBody(goroAcc, goro)
 	}
 	return true
 }
@@ -122,40 +126,7 @@ func onceDoCallback(fn *ssa.Function) bool {
 	return false
 }
 
-func goroWritesDominateBody(accs []dataAccess, goro map[*ssa.Function]bool) bool {
-	// Every write is in a block that dominates all other accesses of that
-	// field in the goroutine (one-time rewrite at start).
-	var writes []dataAccess
-	for _, acc := range accs {
-		if acc.write {
-			writes = append(writes, acc)
-		}
-	}
-	if len(writes) == 0 {
-		return true
-	}
-	for _, w := range writes {
-		wb := w.instr.Block()
-		if wb == nil || blockInCycle(wb) {
-			return false
-		}
-		for _, acc := range accs {
-			if acc.instr == w.instr {
-				continue
-			}
-			ab := acc.instr.Block()
-			if ab == nil {
-				return false
-			}
-			if ab != wb && !wb.Dominates(ab) {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func siblingGoWritesFields(root ssa.Value, g ssa.Instruction, allFuncs map[*ssa.Function]bool, written map[int]bool, whole bool) bool {
+func siblingGoTouchesFields(root ssa.Value, g ssa.Instruction, allFuncs map[*ssa.Function]bool, written map[int]bool, whole bool) bool {
 	if root == nil {
 		return false
 	}
@@ -183,8 +154,9 @@ func siblingGoWritesFields(root ssa.Value, g ssa.Instruction, allFuncs map[*ssa.
 					continue
 				}
 				reach := reachableFuncs(cal, cal.Pkg)
-				for _, acc := range collectOwnDataAccesses(root, reach) {
-					if !acc.write {
+				for rf := range reach {
+					for _, acc := range collectOwnAndRecvAccesses(root, rf) {
+					if isNestedShareSafeAccess(acc) || isObjectInitStore(acc) || isShareSafeFieldStore(acc) {
 						continue
 					}
 					if whole {
@@ -193,9 +165,50 @@ func siblingGoWritesFields(root ssa.Value, g ssa.Instruction, allFuncs map[*ssa.
 					if k, ok := fieldIndexOf(acc); ok && written[k] {
 						return true
 					}
+					if !acc.write {
+						continue
+					}
+					if _, isField := fieldIndexOf(acc); !isField {
+						return true
+					}
+					}
 				}
 			}
 		}
 	}
 	return false
+}
+
+func collectOwnAndRecvAccesses(root ssa.Value, fn *ssa.Function) []dataAccess {
+	if fn == nil {
+		return nil
+	}
+	funcs := map[*ssa.Function]bool{fn: true}
+	out := collectOwnDataAccesses(root, funcs)
+	if len(fn.Params) == 0 {
+		return out
+	}
+	recv := fn.Params[0]
+	if recv == nil || recv == root || !sameElemType(recv.Type(), root.Type()) {
+		return out
+	}
+	return append(out, collectOwnDataAccesses(recv, funcs)...)
+}
+
+func sameElemType(a, b types.Type) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return types.Identical(derefNamed(a), derefNamed(b))
+}
+
+func derefNamed(t types.Type) types.Type {
+	t = types.Unalias(t)
+	for {
+		p, ok := t.(*types.Pointer)
+		if !ok {
+			return types.Unalias(t)
+		}
+		t = types.Unalias(p.Elem())
+	}
 }
