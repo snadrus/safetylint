@@ -16,6 +16,11 @@ touches, or const-index partitioned buffer writers.
 Note: *Exotic* locking simply fails. Just like Escape analysis,
 if you feel like getting complicated, I just haven't implemented your case yet. PRs are welcomed. Keep things in-package when you can. 
 
+This does validate some very complex software with a variety of caching mechanisms. 
+Take its findings seriously: it shows where your code doesn't follow a known-safe pattern, and it knows mutexes, atomics, channels, etc. 
+Note, it's particularly touchy about "go funcPassedIn(&thing)" whose origins it cannot trace, which may be safe, but
+ honestly is usually a huge "code smell". 
+
 ## Install / run
 
 ```bash
